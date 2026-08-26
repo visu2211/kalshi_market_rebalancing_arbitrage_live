@@ -1,0 +1,96 @@
+"""execution.capital — pure ranking/allocation math, no network."""
+
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+
+from execution.capital import (
+    ExecutionCandidate,
+    estimated_capital_required,
+    hourly_return_rate,
+    hours_to_settlement,
+    select_executable,
+)
+from scanner.basket import BasketOpportunity
+
+NOW = datetime(2026, 8, 26, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _opportunity(event_ticker, basket_price, edge, max_size, legs=("A", "B")) -> BasketOpportunity:
+    return BasketOpportunity(
+        event_ticker=event_ticker,
+        direction="buy_basket",
+        legs=list(legs),
+        leg_quotes=[],
+        basket_price_usd=Decimal(str(basket_price)),
+        edge_usd=Decimal(str(edge)),
+        max_size=Decimal(str(max_size)),
+    )
+
+
+def _candidate(event_ticker, basket_price, edge, max_size, hours_out) -> ExecutionCandidate:
+    return ExecutionCandidate(
+        event_ticker=event_ticker,
+        opportunity=_opportunity(event_ticker, basket_price, edge, max_size),
+        expected_settlement_time=NOW + timedelta(hours=hours_out),
+    )
+
+
+def test_hours_to_settlement_basic():
+    later = NOW + timedelta(hours=3)
+    assert hours_to_settlement(NOW, later) == Decimal("3")
+
+
+def test_hours_to_settlement_floors_at_min_for_imminent_or_past_settlement():
+    assert hours_to_settlement(NOW, NOW) == Decimal("0.01")
+    assert hours_to_settlement(NOW, NOW - timedelta(hours=1)) == Decimal("0.01")
+
+
+def test_estimated_capital_required_is_price_times_size():
+    opp = _opportunity("EVT", "0.93", "0.07", "39")
+    assert estimated_capital_required(opp) == Decimal("36.27")
+
+
+def test_hourly_return_rate_favors_faster_settlement_at_equal_edge():
+    opp = _opportunity("EVT", "0.93", "0.07", "39")
+    fast = hourly_return_rate(opp, hours=Decimal("1"))
+    slow = hourly_return_rate(opp, hours=Decimal("10"))
+    assert fast > slow
+    assert fast == slow * 10
+
+
+def test_select_executable_picks_all_when_capital_is_plenty():
+    candidates = [_candidate("A", "0.93", "0.07", "10", hours_out=2), _candidate("B", "0.95", "0.05", "10", hours_out=2)]
+    selected = select_executable(candidates, available_capital=Decimal("1000"), now=NOW)
+    assert {c.event_ticker for c in selected} == {"A", "B"}
+
+
+def test_select_executable_prefers_faster_settling_over_bigger_raw_edge():
+    # BIG has a bigger dollar edge (0.07 vs 0.03) but settles in 20h; FAST
+    # is smaller but settles in 1h — per-hour return should favor FAST.
+    big = _candidate("BIG", "0.93", "0.07", "10", hours_out=20)   # 0.07/0.93/20 = 0.00376/hr
+    fast = _candidate("FAST", "0.97", "0.03", "10", hours_out=1)  # 0.03/0.97/1  = 0.0309/hr
+
+    # Capital only covers one of them: BIG costs 9.30, FAST costs 9.70.
+    selected = select_executable([big, fast], available_capital=Decimal("9.70"), now=NOW)
+    assert [c.event_ticker for c in selected] == ["FAST"]
+
+
+def test_select_executable_skips_unaffordable_but_backfills_cheaper_lower_ranked():
+    expensive_best = _candidate("EXPENSIVE", "0.90", "0.10", "1000", hours_out=1)   # huge cost, best rate
+    cheap_worse = _candidate("CHEAP", "0.99", "0.01", "5", hours_out=5)             # tiny cost, worse rate
+
+    selected = select_executable([expensive_best, cheap_worse], available_capital=Decimal("10"), now=NOW)
+    assert [c.event_ticker for c in selected] == ["CHEAP"]
+
+
+def test_select_executable_returns_empty_when_nothing_fits():
+    candidates = [_candidate("A", "0.93", "0.07", "1000", hours_out=1)]
+    assert select_executable(candidates, available_capital=Decimal("1"), now=NOW) == []
+
+
+def test_select_executable_spends_within_budget_not_over():
+    a = _candidate("A", "1.00", "0.10", "10", hours_out=1)   # costs 10.00
+    b = _candidate("B", "1.00", "0.09", "10", hours_out=1)   # costs 10.00, ranked below A
+    selected = select_executable([a, b], available_capital=Decimal("15"), now=NOW)
+    # only A fits alone in the 15 budget (10 spent, 5 left isn't enough for B's 10)
+    assert [c.event_ticker for c in selected] == ["A"]

@@ -1,0 +1,18 @@
+[Unit]
+Description=Kalshi single-market rebalancing scanner (same-day live variant)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__DEPLOY_USER__
+WorkingDirectory=__DEPLOY_DIR__
+ExecStart=__DEPLOY_DIR__/.venv/bin/python scripts/run_scanner.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kalshi-scanner-live
+
+[Install]
+WantedBy=multi-user.target

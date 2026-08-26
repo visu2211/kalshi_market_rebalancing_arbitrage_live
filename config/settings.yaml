@@ -1,0 +1,36 @@
+# kalshi-rebalancer-live configuration
+# Secrets (API key id, private key path) do NOT go here — see .env.
+# This file holds strategy/risk parameters only, and is safe to commit.
+#
+# _live variant: Stage 1 only keeps events settling by the end of the
+# current UTC calendar day (scanner/filters.py's end_of_day_utc) — there is
+# no configurable horizon here, unlike the sibling kalshi_market_rebalancing_arbitrage
+# project's scanner.max_days_to_close.
+
+kalshi:
+  base_url: "https://api.elections.kalshi.com/trade-api/v2"
+  ws_url: "wss://api.elections.kalshi.com/trade-api/ws/v2"
+  request_timeout_s: 10
+  max_retries: 3
+
+scanner:
+  min_outcome_legs: 2                   # Stage 1: N floor
+  max_outcome_legs: 6                   # Stage 1: N cap
+  min_depth_contracts: 25               # Stage 2: reject if the thinnest leg has less size than this
+  rescan_interval_s: 300                # how often Stage 1 re-runs to refresh Stage 3's WS subscription set (5 min — Kalshi's public GET endpoints aren't metered, and a full pass takes seconds, well under this)
+  orderbook_depth: 5                    # book depth to request per leg in Stage 2's --once REST summary (only need top-of-book)
+  max_ws_legs: 200                      # Stage 3: WS subscription budget (individual market tickers) — scanner.filters.select_by_volume fills this with the highest-24h-volume same-day events first
+
+arb:
+  buy_basket_max_cost_usd: 0.98         # sum(ask_i) + sum(fee_i) must be below this to flag a buy-basket opportunity — the only direction implemented, see scanner/basket.py
+
+logging:
+  level: "INFO"
+  opportunities_log_path: "data/opportunities.jsonl"   # append-only, one JSON line per detected opportunity
+  status_path: "data/scanner_status.json"              # overwritten each cycle/heartbeat — what stream/monitor.py is currently watching; read by ui/app.py
+
+execution:
+  enabled: true                                                 # re-armed 2026-08-26 after batching + all-or-nothing unwind + confirmation + position reconciliation + circuit breaker (execution/executor.py, stream/monitor.py). History (data/opportunities.jsonl, data/orders.jsonl) reset to empty the same day, so everything from here on reflects this configuration.
+  demo_base_url: "https://demo-api.kalshi.co/trade-api/v2"       # separate account/book from kalshi.base_url above — see execution/executor.py
+  orders_log_path: "data/orders.jsonl"                          # append-only, one JSON line per leg order attempt ("kind": "basket" or "unwind")
+  circuit_breaker_max_mismatches: 2                             # consecutive leg-mismatched baskets before auto-disabling execution for the rest of the process — see stream/monitor.py's _CircuitBreaker

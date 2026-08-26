@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Secrets — never commit keys/credentials
+.env
+*.pem
+*.key
+secrets/
+config/settings.local.yaml
+
+# Data (JSONL opportunity log)
+data/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,16 @@
+httpx>=0.27
+websockets>=13.0        # additional_headers= param (extra_headers= was renamed/deprecated in 13)
+cryptography>=42.0        # RSA-PSS signing for the WS handshake (see kalshi/client.py)
+pyyaml>=6.0
+python-dotenv>=1.0
+tenacity>=8.2              # retry/backoff for REST + WS reconnects
+structlog>=24.1
+
+# --- dev/test ---
+pytest>=8.0
+pytest-asyncio>=0.23
+ruff>=0.4
+
+# --- ui ---
+streamlit>=1.50               # column_config.ProgressColumn + dataframe width= (ui/app.py)
+pandas>=2.0
