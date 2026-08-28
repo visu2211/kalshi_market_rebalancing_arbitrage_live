@@ -1,9 +1,8 @@
 """Entry point — same-day ("_live") variant of the sibling
 kalshi_market_rebalancing_arbitrage scanner: Stage 1 only keeps events
 settling by the end of the current UTC calendar day (scanner/filters.py),
-and a detected opportunity is filled with a short-expiration (IOC-style)
-order sized to exactly the observed book depth, so it either fills at the
-priced-in price or doesn't fill at all — see execution/executor.py.
+and a detected opportunity is attempted with one V2 batch of per-leg
+fill-or-kill orders — see execution/executor.py.
 
     python scripts/run_scanner.py [--once]
 
@@ -25,6 +24,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import fcntl
 import logging
 import sys
 from pathlib import Path
@@ -41,6 +41,28 @@ from scanner.orderbook_scan import run_stage2
 from stream.monitor import run_stage3
 
 logger = structlog.get_logger(__name__)
+
+
+@contextlib.contextmanager
+def _execution_process_lock(path: Path):
+    """Hold a non-blocking OS lock for the lifetime of an armed process."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+")
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(f"another armed scanner already holds {path}") from exc
+        handle.seek(0)
+        handle.truncate()
+        handle.write(str(__import__("os").getpid()))
+        handle.flush()
+        yield
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 def _configure_logging(level: str) -> None:
@@ -99,36 +121,66 @@ async def run_forever(settings: Settings) -> None:
             private_key_path=settings.kalshi.private_key_path,
         ))
 
-        demo_client = None
+        execution_client = None
         if settings.execution.enabled:
-            # Separate KalshiClient/account — execution/executor.py places
-            # orders here, never against `client` above (prod). Only opened
-            # when execution.enabled, so a detect-only run never needs demo
-            # credentials at all.
-            demo_client = await stack.enter_async_context(KalshiClient(
-                base_url=settings.execution.demo_base_url,
-                request_timeout_s=settings.kalshi.request_timeout_s,
-                max_retries=settings.kalshi.max_retries,
-                api_key_id=settings.execution.demo_api_key_id,
-                private_key_path=settings.execution.demo_private_key_path,
-            ))
+            # A separate KalshiClient from `client` above regardless of
+            # target — `client` is detection-only for the whole life of
+            # this process; execution/executor.py's orders always go
+            # through this one instead, so a bug in detection code can
+            # never accidentally place an order through the wrong client.
+            # Only opened when execution.enabled, so a detect-only run
+            # never needs execution credentials at all.
+            #
+            # target == "prod" is REAL MONEY on the real Kalshi account
+            # (VERIFIED LIVE 2026-08-26: the same KALSHI_API_KEY_ID/
+            # KALSHI_PRIVATE_KEY_PATH already used for detection does have
+            # order-placement permission) — see execution/executor.py's
+            # module docstring before ever setting this.
+            if settings.execution.target == "prod":
+                execution_client = await stack.enter_async_context(KalshiClient(
+                    base_url=settings.kalshi.base_url,
+                    request_timeout_s=settings.kalshi.request_timeout_s,
+                    max_retries=settings.kalshi.max_retries,
+                    api_key_id=settings.kalshi.api_key_id,
+                    private_key_path=settings.kalshi.private_key_path,
+                ))
+            else:
+                execution_client = await stack.enter_async_context(KalshiClient(
+                    base_url=settings.execution.demo_base_url,
+                    request_timeout_s=settings.kalshi.request_timeout_s,
+                    max_retries=settings.kalshi.max_retries,
+                    api_key_id=settings.execution.demo_api_key_id,
+                    private_key_path=settings.execution.demo_private_key_path,
+                ))
 
         ws_client = KalshiWSClient(settings.kalshi.ws_url, client)
-        await run_stage3(client, ws_client, settings, demo_client=demo_client)
+        await run_stage3(client, ws_client, settings, execution_client=execution_client)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--once", action="store_true", help="run Stage 1+2 once and exit, no WS connection")
+    parser.add_argument(
+        "--confirm-live-trading",
+        action="store_true",
+        help="required process-level confirmation when execution.target is prod (REAL MONEY)",
+    )
     args = parser.parse_args()
 
     settings = load_settings()
+    if settings.execution.enabled and settings.execution.target == "prod" and not args.confirm_live_trading:
+        parser.error("production execution requires --confirm-live-trading")
     _configure_logging(settings.logging.level)
 
     if args.once:
         asyncio.run(run_once(settings))
     else:
-        asyncio.run(run_forever(settings))
+        lock_context = (
+            _execution_process_lock(settings.execution.process_lock_path)
+            if settings.execution.enabled else contextlib.nullcontext()
+        )
+        with lock_context:
+            asyncio.run(run_forever(settings))
 
 
 if __name__ == "__main__":

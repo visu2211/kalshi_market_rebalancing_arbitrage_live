@@ -28,6 +28,15 @@ def test_taker_fee_symmetric_around_half():
     assert taker_fee(Decimal("0.30")) == taker_fee(Decimal("0.70"))
 
 
+def test_multi_contract_fee_rounds_once_after_quantity():
+    # ceil(0.07 * 10 * .04 * .96 * 100) = ceil(2.688) cents
+    assert taker_fee(Decimal("0.04"), Decimal(10)) == Decimal("0.03")
+
+
+def test_fee_multiplier_applies_before_rounding():
+    assert taker_fee(Decimal("0.50"), Decimal(10), Decimal("1.5")) == Decimal("0.27")
+
+
 @pytest.mark.parametrize("price", ["0.00", "1.00", "-0.10", "1.50"])
 def test_taker_fee_rejects_out_of_range_price(price):
     with pytest.raises(ValueError):

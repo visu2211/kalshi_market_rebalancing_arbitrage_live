@@ -49,7 +49,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, time, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 
@@ -60,6 +60,7 @@ class EventCandidate:
     leg_tickers: list[str]                          # open nested market tickers
     leg_volume_24h: dict[str, Optional[Decimal]]     # ticker -> volume_24h, for Stage 2's activity filter
     expected_settlement_time: datetime               # max across legs of expected_expiration_time (falls back to close_time) — see module docstring
+    fee_multiplier: Decimal = Decimal(1)              # multiplier on the standard quadratic taker fee
 
 
 def _parse_iso(value: Optional[str]) -> Optional[datetime]:
@@ -70,6 +71,20 @@ def _parse_iso(value: Optional[str]) -> Optional[datetime]:
 
 def _end_of_day_utc(now: datetime) -> datetime:
     return datetime.combine(now.date(), time.max, tzinfo=timezone.utc)
+
+
+def _is_supported_market(market: dict) -> bool:
+    try:
+        notional = Decimal(str(market.get("notional_value_dollars", "1")))
+    except (InvalidOperation, ValueError, TypeError):
+        return False
+    return (
+        market.get("status") == "active"
+        and market.get("market_type") in (None, "binary")
+        and not market.get("is_provisional", False)
+        and notional.is_finite()
+        and notional == Decimal(1)
+    )
 
 
 def filter_events(
@@ -87,7 +102,21 @@ def filter_events(
 
     candidates: list[EventCandidate] = []
     for event in raw_events:
-        if not event.get("mutually_exclusive", False):
+        # MECNET is the only supported mutually-exclusive collateral
+        # structure. It does not by itself prove collective exhaustiveness;
+        # live execution intentionally accepts this residual semantic risk
+        # after full-rule review.
+        if not event.get("mutually_exclusive", False) or event.get("collateral_return_type") != "MECNET":
+            continue
+
+        fee_type = event.get("fee_type_override")
+        if fee_type not in (None, "", "quadratic"):
+            continue
+        try:
+            fee_multiplier = Decimal(str(event.get("fee_multiplier_override", 1)))
+        except (InvalidOperation, ValueError, TypeError):
+            continue
+        if not fee_multiplier.is_finite() or fee_multiplier < 0:
             continue
 
         # Kalshi's nested market `status` field reads "active" for a
@@ -96,15 +125,24 @@ def filter_events(
         # query param filters at the *event* level; individual legs can
         # still show up "finalized" inside an otherwise-open multi-leg
         # event, e.g. one candidate has already dropped out).
-        open_legs = [m for m in event.get("markets", []) if m.get("status") == "active"]
+        markets = event.get("markets", [])
+        # Trading only active legs from a partially settled event is not an
+        # exhaustive basket. Unknown market types, provisional contracts,
+        # and non-$1 notionals likewise invalidate the fixed payout proof.
+        if not markets or not all(_is_supported_market(m) for m in markets):
+            continue
+        open_legs = markets
         if not (min_outcome_legs <= len(open_legs) <= max_outcome_legs):
             continue
 
+        # Every leg must carry a parseable settlement time. Accepting an event
+        # because *some* leg parsed meant the horizon was decided from a subset,
+        # so a leg settling next week could ride along inside a basket the
+        # same-day filter had already approved.
         leg_settlement_times = [
-            t for t in (_parse_iso(m.get("expected_expiration_time") or m.get("close_time")) for m in open_legs)
-            if t is not None
+            _parse_iso(m.get("expected_expiration_time") or m.get("close_time")) for m in open_legs
         ]
-        if not leg_settlement_times:
+        if any(t is None for t in leg_settlement_times):
             continue
         expected_settlement_time = max(leg_settlement_times)
         if expected_settlement_time > end_of_day:
@@ -130,6 +168,7 @@ def filter_events(
                 leg_tickers=[m["ticker"] for m in open_legs],
                 leg_volume_24h=leg_volume_24h,
                 expected_settlement_time=expected_settlement_time,
+                fee_multiplier=fee_multiplier,
             )
         )
 

@@ -1,4 +1,4 @@
-"""Kalshi's parabolic taker fee schedule.
+"""Kalshi's quadratic taker fee schedule.
 
     fee_cents = ceil(0.07 * P * (1-P) * 100)
 
@@ -17,10 +17,28 @@ _FEE_RATE = Decimal("0.07")
 _HUNDRED = Decimal("100")
 
 
-def taker_fee(price: Decimal) -> Decimal:
-    """Per-contract taker fee in USD for a fill at `price`."""
+def taker_fee(
+    price: Decimal,
+    contracts: Decimal = Decimal(1),
+    fee_multiplier: Decimal = Decimal(1),
+) -> Decimal:
+    """Total taker fee for one fill, rounded once at the order level.
+
+    Kalshi rounds ``rate * contracts * price * (1-price)`` up to the next
+    cent.  Rounding a one-contract fee and multiplying it by size can
+    materially overstate the fee and does not reproduce the exchange's
+    calculation.
+
+    ``fee_multiplier`` is the event/series multiplier applied to the base
+    quadratic rate. Callers must not pass metadata for a different fee
+    type; those events are rejected by the structural filter.
+    """
     if not (Decimal(0) < price < Decimal(1)):
         raise ValueError(f"taker_fee: price must be strictly between 0 and 1, got {price}")
-    raw_cents = _FEE_RATE * price * (Decimal(1) - price) * _HUNDRED
+    if contracts <= 0:
+        raise ValueError(f"taker_fee: contracts must be positive, got {contracts}")
+    if fee_multiplier < 0:
+        raise ValueError(f"taker_fee: fee_multiplier must be non-negative, got {fee_multiplier}")
+    raw_cents = _FEE_RATE * fee_multiplier * contracts * price * (Decimal(1) - price) * _HUNDRED
     fee_cents = raw_cents.to_integral_value(rounding=ROUND_CEILING)
     return fee_cents * _CENT

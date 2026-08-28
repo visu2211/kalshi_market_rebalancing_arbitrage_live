@@ -14,3 +14,8 @@ ruff>=0.4
 # --- ui ---
 streamlit>=1.50               # column_config.ProgressColumn + dataframe width= (ui/app.py)
 pandas>=2.0
+
+# --- paper backtesting (scripts/run_paper_backtest.py) ---
+# Local sibling package, not on PyPI — install separately:
+#   pip install -e ../paper_trading_engine
+# -e ../paper_trading_engine

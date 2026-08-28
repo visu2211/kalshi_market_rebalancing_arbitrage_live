@@ -8,7 +8,7 @@ and README.md's docstrings)."""
 
 from decimal import Decimal
 
-from scanner.basket import LegQuote, compute_opportunity
+from scanner.basket import LegQuote, compute_opportunity, incoherent_legs
 
 BUY_MAX = Decimal("0.98")
 MIN_DEPTH = Decimal("25")
@@ -72,3 +72,70 @@ def test_overpriced_basket_is_not_flagged_even_though_bids_would_have_been_a_sel
 
 def test_empty_legs_returns_none():
     assert compute_opportunity("KXTEST-3", [], BUY_MAX, MIN_DEPTH) is None
+
+
+def test_basket_uses_aggregate_fee_for_requested_execution_size():
+    legs = [
+        _leg("A", "0.04", 100, "0.03", 100),
+        _leg("B", "0.90", 100, "0.89", 100),
+    ]
+    opp = compute_opportunity(
+        "KXTEST-SIZED", legs, Decimal("0.96"), Decimal(1), contract_count=Decimal(10)
+    )
+    assert opp is not None
+    # A: 3 cents total; B: 7 cents total. Per contract cost = .94 + .01.
+    assert opp.basket_price_usd == Decimal("0.95")
+
+
+# --- corrupt local book rejection (added 2026-08-27) -------------------------
+# scanner.basket.incoherent_legs: a locked or crossed book is an instant free
+# round-trip, so a live exchange never shows one — seeing it means the local
+# book is wrong, not that an edge exists. This is what produced the phantom
+# 3-34c "opportunities" in data/opportunities.jsonl.
+
+
+def test_crossed_leg_is_rejected_even_when_the_basket_looks_cheap():
+    """The exact phantom shape: one corrupt leg with an impossibly good ask
+    (below its own bid) drags a normal basket under the threshold."""
+    legs = [
+        _leg("A", "0.30", 5000, "0.51", 800),   # crossed: bid 0.51 > ask 0.30
+        _leg("B", "0.49", 100, "0.48", 100),
+    ]
+    assert sum(l.best_ask for l in legs) < BUY_MAX      # would otherwise flag
+    assert compute_opportunity("KXPHANTOM", legs, BUY_MAX, MIN_DEPTH) is None
+
+
+def test_locked_leg_is_rejected():
+    legs = [
+        _leg("A", "0.40", 100, "0.40", 100),   # locked: bid == ask
+        _leg("B", "0.45", 100, "0.44", 100),
+    ]
+    assert compute_opportunity("KXLOCKED", legs, BUY_MAX, MIN_DEPTH) is None
+
+
+def test_out_of_range_price_is_rejected_rather_than_raising():
+    """best_ask of 0 is reachable when a synthesized ask comes from a 1.00 NO
+    bid; taker_fee raises on it, which would kill the WS loop mid-tick."""
+    legs = [
+        _leg("A", "0", 100, "0", 100),
+        _leg("B", "0.45", 100, "0.44", 100),
+    ]
+    assert compute_opportunity("KXZERO", legs, BUY_MAX, MIN_DEPTH) is None
+
+
+def test_incoherent_legs_names_only_the_offending_legs():
+    good = _leg("GOOD", "0.49", 100, "0.48", 100)
+    crossed = _leg("CROSSED", "0.30", 100, "0.51", 100)
+    locked = _leg("LOCKED", "0.40", 100, "0.40", 100)
+    assert incoherent_legs([good, crossed, locked]) == [crossed, locked]
+    assert incoherent_legs([good]) == []
+
+
+def test_coherent_basket_still_detected():
+    """Guard against the new check being too strict: a normal one-cent-spread
+    book must still pass."""
+    legs = [
+        _leg("A", "0.04", 120, "0.03", 120),
+        _leg("B", "0.90", 100, "0.89", 100),
+    ]
+    assert compute_opportunity("KXOK", legs, BUY_MAX, MIN_DEPTH) is not None

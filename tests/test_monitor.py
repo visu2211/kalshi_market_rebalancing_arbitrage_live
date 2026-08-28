@@ -4,20 +4,66 @@ and delta-is-relative semantics confirmed live 2026-08-26, see
 LocalBook's docstring and kalshi/ws_client.py's docstring). No network."""
 
 import json
+from datetime import datetime, timezone
 from decimal import Decimal
+from copy import deepcopy
+from types import SimpleNamespace
+
+import pytest
 
 from execution.executor import AtomicExecutionResult, LegExecutionResult
-from kalshi.client import ExchangeError, OrderAction
+from kalshi.client import ExchangeError, OrderAction, Orderbook, OrderbookLevel, RateLimitError, Side
+from kalshi.ws_client import WS_RECONNECTED_MESSAGE_TYPE
+from scanner.basket import BasketOpportunity, LegQuote
 from stream.monitor import (
     _BALANCE_CACHE_TTL_S,
+    run_stage3,
     LocalBook,
     _BalanceCache,
+    _cap_opportunity_size,
     _CircuitBreaker,
+    _confirm_opportunity_via_rest,
     _reconcile_positions,
+    _realized_unwind_loss,
+    _unmatched_entry_exposure,
     _update_believed_positions,
     _write_scanner_status,
     handle_message,
 )
+
+
+def _stage1_settings(tmp_path):
+    """Real Settings via the loader, pointed at a tmp dir — run_stage3 reads
+    risk_state_path/status_path/rescan_interval_s, not just a couple of fields."""
+    import yaml
+    from config.loader import load_settings
+    from tests.test_config_loader import BASE_CONFIG
+
+    config = deepcopy(BASE_CONFIG)
+    config["scanner"]["rescan_interval_s"] = 60
+    config["logging"]["status_path"] = str(tmp_path / "status.json")
+    config["logging"]["opportunities_log_path"] = str(tmp_path / "opportunities.jsonl")
+    config["execution"]["risk_state_path"] = str(tmp_path / "risk_state.json")
+    config["execution"]["orders_log_path"] = str(tmp_path / "orders.jsonl")
+    config["execution"]["alerts_log_path"] = str(tmp_path / "alerts.jsonl")
+    config["execution"]["process_lock_path"] = str(tmp_path / "execution.lock")
+    path = tmp_path / "settings.yaml"
+    path.write_text(yaml.safe_dump(config))
+    return load_settings(path)
+
+
+async def _noop_sleep(seconds):
+    return None
+
+
+def _confirm_settings(max_order_size="1", buy_max="0.98", min_depth="25"):
+    """_confirm_opportunity_via_rest only reads these three values; a stub
+    keeps the test from restating the whole Settings tree."""
+    return SimpleNamespace(
+        arb=SimpleNamespace(buy_basket_max_cost_usd=Decimal(buy_max)),
+        scanner=SimpleNamespace(min_depth_contracts=Decimal(min_depth)),
+        execution=SimpleNamespace(max_order_size_contracts=Decimal(max_order_size)),
+    )
 
 
 class _FakeBalanceClient:
@@ -64,10 +110,20 @@ def test_apply_delta_is_relative_not_absolute():
     assert Decimal("0.40") not in book.yes_bids  # nets to <= 0, level removed
 
 
-def test_apply_delta_creates_new_level_from_zero():
+def test_apply_delta_before_snapshot_is_ignored():
     book = LocalBook()
     book.apply_delta("no", Decimal("0.62"), Decimal("30"))
-    assert book.no_bids[Decimal("0.62")] == Decimal("30")
+    assert book.no_bids == {}
+
+
+def test_book_freshness_expires(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr("stream.monitor.time.monotonic", lambda: clock[0])
+    book = LocalBook()
+    book.apply_snapshot([(Decimal("0.40"), Decimal("1"))], [(Decimal("0.50"), Decimal("1"))])
+    assert book.is_fresh(1.0)
+    clock[0] += 1.1
+    assert not book.is_fresh(1.0)
 
 
 def test_handle_message_orderbook_snapshot_uses_dollars_fp_keys():
@@ -316,6 +372,28 @@ def test_update_believed_positions_accumulates_across_multiple_calls():
     assert believed == {"A": Decimal("15")}
 
 
+def test_realized_unwind_loss_uses_actual_prices_and_fees():
+    buy = _leg_result("A", "2")
+    buy.limit_price = Decimal("0.60")
+    buy.order_result.average_fill_price = Decimal("0.59")
+    buy.order_result.average_fee_paid = Decimal("0.01")
+    sell = _leg_result("A", "2")
+    sell.action = OrderAction.SELL
+    sell.order_result.average_fill_price = Decimal("0.50")
+    sell.order_result.average_fee_paid = Decimal("0.01")
+    result = AtomicExecutionResult(leg_results=[buy], unwind_results=[sell], mismatched=True)
+    assert _realized_unwind_loss(result) == Decimal("0.22")
+
+
+def test_unmatched_entry_exposure_counts_only_unsold_excess():
+    buy_a = _leg_result("A", "3")
+    buy_b = _leg_result("B", "1")
+    sell_a = _leg_result("A", "1")
+    sell_a.action = OrderAction.SELL
+    result = AtomicExecutionResult(leg_results=[buy_a, buy_b], unwind_results=[sell_a], mismatched=True, unwind_confirmed=False)
+    assert _unmatched_entry_exposure(result) == Decimal("0.50")
+
+
 class _FakePositionsClient:
     def __init__(self, positions: dict[str, Decimal]):
         self._positions = positions
@@ -337,11 +415,11 @@ async def test_reconcile_positions_detects_a_mismatch():
     assert mismatches == {"A": (Decimal("45"), Decimal("30"))}
 
 
-async def test_reconcile_positions_detects_a_position_we_didnt_know_about():
+async def test_reconcile_positions_ignores_unrelated_account_position():
     believed: dict[str, Decimal] = {}
     client = _FakePositionsClient({"A": Decimal("10")})   # Kalshi shows a position we have no record of
     mismatches = await _reconcile_positions(client, believed)
-    assert mismatches == {"A": (Decimal("0"), Decimal("10"))}
+    assert mismatches == {}
 
 
 async def test_reconcile_positions_returns_empty_on_check_failure_rather_than_raising():
@@ -350,3 +428,256 @@ async def test_reconcile_positions_returns_empty_on_check_failure_rather_than_ra
             raise ExchangeError("network blip")
 
     assert await _reconcile_positions(_FailingClient(), {"A": Decimal("45")}) == {}
+
+
+# ---- _cap_opportunity_size ----
+# execution.max_order_size_contracts is the deliberate ramp-up lever for
+# real money (2026-08-26) — these confirm it actually constrains what
+# gets executed, and that everything else about the opportunity (price,
+# legs, edge) is untouched.
+
+def _opportunity(max_size: str) -> BasketOpportunity:
+    legs = [LegQuote(ticker="A", best_ask=Decimal("0.40"), ask_size=Decimal(max_size), best_bid=Decimal("0.38"), bid_size=Decimal(max_size))]
+    return BasketOpportunity(
+        event_ticker="EVT", direction="buy_basket", legs=["A"], leg_quotes=legs,
+        basket_price_usd=Decimal("0.96"), edge_usd=Decimal("0.04"), max_size=Decimal(max_size),
+    )
+
+
+def test_cap_opportunity_size_reduces_a_larger_max_size():
+    capped = _cap_opportunity_size(_opportunity("900"), max_order_size_contracts=Decimal("1"))
+    assert capped.max_size == Decimal("1")
+
+
+def test_cap_opportunity_size_leaves_a_smaller_max_size_untouched():
+    opp = _opportunity("1")
+    capped = _cap_opportunity_size(opp, max_order_size_contracts=Decimal("5"))
+    assert capped.max_size == Decimal("1")
+    assert capped is opp   # unchanged input returned as-is, not a needless copy
+
+
+def test_cap_opportunity_size_does_not_mutate_other_fields():
+    capped = _cap_opportunity_size(_opportunity("900"), max_order_size_contracts=Decimal("1"))
+    assert capped.event_ticker == "EVT"
+    assert capped.basket_price_usd == Decimal("0.96")
+    assert capped.edge_usd == Decimal("0.04")
+    assert capped.legs == ["A"]
+
+
+def test_cap_opportunity_size_exact_match_returns_same_size():
+    capped = _cap_opportunity_size(_opportunity("1"), max_order_size_contracts=Decimal("1"))
+    assert capped.max_size == Decimal("1")
+
+
+# --- reconnect book invalidation (added 2026-08-27) -------------------------
+# LocalBook.invalidate + kalshi.ws_client's WS_RECONNECTED_MESSAGE_TYPE.
+# snapshot_received used to survive a reconnect, so a delta arriving before
+# that ticker's replacement snapshot mutated the previous connection's book.
+
+
+def test_invalidate_clears_every_level_and_unsets_snapshot_received():
+    book = LocalBook()
+    book.apply_snapshot(yes_levels=[(Decimal("0.51"), Decimal("800"))],
+                        no_levels=[(Decimal("0.48"), Decimal("900"))])
+    book.invalidate()
+    assert book.yes_bids == {}
+    assert book.no_bids == {}
+    assert book.snapshot_received is False
+    assert book.best_yes_quote() is None
+    assert book.is_fresh(1.0) is False
+
+
+def test_delta_after_invalidate_cannot_resurrect_a_stale_book():
+    """The regression: without invalidate(), this delta lands on the previous
+    connection's levels and — because apply_delta refreshes the timestamp —
+    the resulting garbage quote also passes the is_fresh staleness gate."""
+    book = LocalBook()
+    book.apply_snapshot(yes_levels=[(Decimal("0.51"), Decimal("800"))],
+                        no_levels=[(Decimal("0.48"), Decimal("900"))])
+    assert book.best_yes_quote()[0] == Decimal("0.52")   # sane pre-reconnect ask
+
+    book.invalidate()
+    book.apply_delta("no", Decimal("0.70"), Decimal("5000"))   # would synthesize a 0.30 ask
+
+    assert book.no_bids == {}
+    assert book.best_yes_quote() is None
+    assert book.is_fresh(1.0) is False
+
+
+def test_reconnect_sentinel_is_not_mistaken_for_a_book_message():
+    books = {"T": LocalBook()}
+    assert handle_message({"type": WS_RECONNECTED_MESSAGE_TYPE}, books) is None
+    assert books["T"].snapshot_received is False
+
+
+# --- REST confirmation before submission (added 2026-08-27) -----------------
+# _confirm_opportunity_via_rest re-reads Kalshi's own book for every leg
+# immediately before submission, so an edge that exists only in local WS state
+# cannot reach the exchange.
+
+
+class _FakeBookClient:
+    """get_orderbook stand-in returning canned top-of-book per ticker.
+    `error_tickers` raise ExchangeError instead."""
+
+    def __init__(self, quotes, error_tickers=frozenset()):
+        self.quotes = quotes          # ticker -> (ask, ask_size, bid, bid_size)
+        self.error_tickers = error_tickers
+        self.calls = []
+
+    async def get_orderbook(self, market_id, side=None, depth=None):
+        self.calls.append(market_id)
+        if market_id in self.error_tickers:
+            raise ExchangeError(f"boom {market_id}")
+        ask, ask_size, bid, bid_size = self.quotes[market_id]
+        return Orderbook(
+            market_id=market_id, side=Side.YES,
+            bids=[OrderbookLevel(price=Decimal(bid), size=Decimal(bid_size))],
+            asks=[OrderbookLevel(price=Decimal(ask), size=Decimal(ask_size))],
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+def _ws_opportunity(basket_price="0.74", legs=(("A", "0.30", 5000, "0.51", 800),
+                                               ("B", "0.44", 100, "0.43", 100))):
+    quotes = [LegQuote(ticker=t, best_ask=Decimal(a), ask_size=Decimal(asz),
+                       best_bid=Decimal(b), bid_size=Decimal(bsz)) for t, a, asz, b, bsz in legs]
+    return BasketOpportunity(
+        event_ticker="KXTEST", direction="buy_basket", legs=[q.ticker for q in quotes],
+        leg_quotes=quotes, basket_price_usd=Decimal(basket_price),
+        edge_usd=Decimal(1) - Decimal(basket_price), max_size=Decimal("100"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_rest_confirmation_rejects_a_phantom_ws_edge():
+    """WS says the basket costs $0.74; Kalshi's own book says $1.01."""
+    settings = _confirm_settings()
+    client = _FakeBookClient({"A": ("0.52", "5000", "0.51", "800"),
+                              "B": ("0.49", "100", "0.48", "100")})
+    assert await _confirm_opportunity_via_rest(client, _ws_opportunity(), settings) is None
+    assert client.calls == ["A", "B"]
+
+
+@pytest.mark.asyncio
+async def test_rest_confirmation_returns_capped_opportunity_priced_off_rest_quotes():
+    settings = _confirm_settings()
+    client = _FakeBookClient({"A": ("0.04", "5000", "0.03", "800"),
+                              "B": ("0.90", "100", "0.89", "100")})
+    confirmed = await _confirm_opportunity_via_rest(client, _ws_opportunity(), settings)
+
+    assert confirmed is not None
+    assert [q.best_ask for q in confirmed.leg_quotes] == [Decimal("0.04"), Decimal("0.90")]
+    assert confirmed.max_size == Decimal("1")   # capped to max_order_size_contracts
+    assert confirmed.basket_price_usd == Decimal("0.96")   # 0.94 + 2c of size-1 fees
+
+
+@pytest.mark.asyncio
+async def test_rest_confirmation_returns_none_when_a_leg_fetch_fails():
+    settings = _confirm_settings()
+    client = _FakeBookClient({"A": ("0.04", "5000", "0.03", "800"),
+                              "B": ("0.90", "100", "0.89", "100")},
+                             error_tickers=frozenset({"B"}))
+    assert await _confirm_opportunity_via_rest(client, _ws_opportunity(), settings) is None
+
+
+@pytest.mark.asyncio
+async def test_rest_confirmation_rejects_an_incoherent_rest_book():
+    settings = _confirm_settings()
+    client = _FakeBookClient({"A": ("0.04", "5000", "0.30", "800"),   # bid > ask
+                              "B": ("0.90", "100", "0.89", "100")})
+    assert await _confirm_opportunity_via_rest(client, _ws_opportunity(), settings) is None
+
+
+# --- Stage 1 resilience (added 2026-08-27) ----------------------------------
+# run_stage3's Stage 1 REST pass was unguarded: data/scanner.log records a run
+# ending on `RateLimitError: Kalshi rate limit hit on GET /events`. A detection
+# loop has to outlive a transient exchange fault.
+
+
+class _StopLoop(Exception):
+    """Sentinel to break run_stage3's `while True` inside a test."""
+
+
+class _FakeEventsClient:
+    """get_all_events replays `outcomes` in order: an exception is raised, a
+    list is returned. Exhausting the script raises _StopLoop to end the loop."""
+
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    @property
+    def has_signing_credentials(self):
+        return False   # keeps the loop out of the WS path; Stage 1 still runs
+
+    async def get_all_events(self, status=None, with_nested_markets=False):
+        self.calls += 1
+        if not self.outcomes:
+            raise _StopLoop
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+@pytest.mark.asyncio
+async def test_stage1_rate_limit_does_not_end_the_loop(tmp_path, monkeypatch):
+    settings = _stage1_settings(tmp_path)
+    monkeypatch.setattr("stream.monitor.asyncio.sleep", _noop_sleep)
+    client = _FakeEventsClient([
+        RateLimitError("Kalshi rate limit hit on GET /events"),
+        ExchangeError("Kalshi server error on GET /events: 502"),
+        [],                      # recovers: a clean (empty) Stage 1 pass
+    ])
+
+    with pytest.raises(_StopLoop):
+        await run_stage3(client, ws_client=None, settings=settings, execution_client=None)
+
+    assert client.calls == 4   # 2 failures survived, 1 clean pass, then the sentinel
+    status = json.loads(settings.logging.status_path.read_text())
+    assert status["phase"] in ("idle_no_candidates", "idle_stage1_error")
+
+
+@pytest.mark.asyncio
+async def test_stage1_backoff_escalates_then_resets_after_a_clean_pass(tmp_path, monkeypatch):
+    settings = _stage1_settings(tmp_path)
+    slept: list[float] = []
+
+    async def record_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr("stream.monitor.asyncio.sleep", record_sleep)
+    client = _FakeEventsClient([
+        ExchangeError("boom 1"),
+        ExchangeError("boom 2"),
+        ExchangeError("boom 3"),
+        [],                      # clean pass resets the backoff
+        ExchangeError("boom 4"),
+    ])
+
+    with pytest.raises(_StopLoop):
+        await run_stage3(client, ws_client=None, settings=settings, execution_client=None)
+
+    # 5, 10, 20 escalating; then the empty-candidate cycle sleeps the rescan
+    # interval; then the post-recovery failure starts over at the floor.
+    assert slept[:3] == [5, 10, 20]
+    assert slept[4] == 5
+
+
+@pytest.mark.asyncio
+async def test_stage1_backoff_is_capped_at_the_rescan_interval(tmp_path, monkeypatch):
+    settings = _stage1_settings(tmp_path)
+    slept: list[float] = []
+
+    async def record_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr("stream.monitor.asyncio.sleep", record_sleep)
+    client = _FakeEventsClient([ExchangeError(f"boom {i}") for i in range(8)])
+
+    with pytest.raises(_StopLoop):
+        await run_stage3(client, ws_client=None, settings=settings, execution_client=None)
+
+    assert max(slept) == settings.scanner.rescan_interval_s
+    assert slept[-1] == settings.scanner.rescan_interval_s

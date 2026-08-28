@@ -110,13 +110,6 @@ async def _run_scan(settings: Settings) -> tuple[int, list[EventCandidate], list
         return len(raw_events), candidates, active_candidates, list(legs)
 
 
-def _safe_fee(price: Decimal) -> Decimal:
-    """taker_fee() only accepts 0 < price < 1 — a leg quoted at exactly the
-    boundary (a near-certain outcome) is priced with $0 fee here rather
-    than crashing the whole dashboard render."""
-    return taker_fee(price) if Decimal(0) < price < Decimal(1) else Decimal(0)
-
-
 def _event_rows(candidates: list[EventCandidate], legs_by_event: dict[str, list[LegSnapshot]], settings: Settings) -> list[dict]:
     rows = []
     for c in candidates:
@@ -127,12 +120,22 @@ def _event_rows(candidates: list[EventCandidate], legs_by_event: dict[str, list[
         ]
         missing = len(leg_snaps) - len(quotes)
 
-        buy_cost = sum((q.best_ask + _safe_fee(q.best_ask) for q in quotes), start=Decimal(0)) if quotes else None
+        configured_size = getattr(settings.execution, "max_order_size_contracts", Decimal(1))
+        execution_size = min(configured_size, min((q.ask_size for q in quotes), default=Decimal(1)))
+        buy_cost = (
+            sum(
+                (q.best_ask + taker_fee(q.best_ask, execution_size, c.fee_multiplier) / execution_size for q in quotes),
+                start=Decimal(0),
+            )
+            if quotes else None
+        )
         opportunity = (
             compute_opportunity(
                 c.event_ticker, quotes,
                 settings.arb.buy_basket_max_cost_usd,
                 settings.scanner.min_depth_contracts,
+                contract_count=execution_size,
+                fee_multiplier=c.fee_multiplier,
             )
             if quotes and missing == 0 else None
         )
@@ -186,17 +189,47 @@ def _load_status(path: Path) -> Optional[dict]:
 
 
 def _opportunity_history_rows(records: list[dict]) -> list[dict]:
-    return [
-        {
+    rows = []
+    for r in records:
+        quotes = r.get("leg_quotes") or []
+        # Thinnest leg binds the whole basket — it is the size actually
+        # obtainable, and the one most likely to be a stale or token quote.
+        thinnest = min((Decimal(q["ask_size"]) for q in quotes), default=None)
+        widest = max((Decimal(q["spread"]) for q in quotes), default=None)
+        rows.append({
             "detected_at": r.get("detected_at"),
             "event_ticker": r.get("event_ticker"),
             "direction": r.get("direction"),
-            "legs": ", ".join(r.get("legs", [])),
+            "leg_count": len(r.get("legs", [])),
+            "sum_ask_usd": r.get("sum_ask_usd"),
+            "fees_usd": r.get("fees_usd"),
             "basket_price_usd": r.get("basket_price_usd"),
             "edge_usd": r.get("edge_usd"),
             "max_size": r.get("max_size"),
+            "thinnest_leg_size": float(thinnest) if thinnest is not None else None,
+            "widest_leg_spread": float(widest) if widest is not None else None,
+        })
+    return rows
+
+
+def _opportunity_leg_rows(record: dict) -> list[dict]:
+    """Per-leg quotes for one detected basket, in submission order.
+
+    A basket price alone cannot show which leg carried the edge, whether a leg
+    was barely two-sided, or how thin the binding leg was — and those decide
+    whether the basket was genuinely executable.
+    """
+    return [
+        {
+            "ticker": q.get("ticker"),
+            "ask": float(q["ask"]) if q.get("ask") is not None else None,
+            "ask_size": float(q["ask_size"]) if q.get("ask_size") is not None else None,
+            "bid": float(q["bid"]) if q.get("bid") is not None else None,
+            "bid_size": float(q["bid_size"]) if q.get("bid_size") is not None else None,
+            "spread": float(q["spread"]) if q.get("spread") is not None else None,
+            "market_url": _kalshi_market_url(q.get("ticker")),
         }
-        for r in records
+        for q in (record.get("leg_quotes") or [])
     ]
 
 
@@ -205,6 +238,8 @@ def _order_history_rows(records: list[dict]) -> list[dict]:
         {
             "placed_at": r.get("placed_at"),
             "kind": r.get("kind", "basket"),   # "basket" (original attempt) or "unwind" (offsetting flatten after a mismatch)
+            "execution_stage": leg.get("execution_stage", "entry" if r.get("kind", "basket") == "basket" else "unwind"),
+            "target": r.get("target", "demo"),   # "demo" or "prod" (REAL MONEY) — absent on rows logged before this field existed
             "event_ticker": r.get("event_ticker"),
             "direction": r.get("direction"),
             "ticker": leg.get("ticker"),
@@ -214,6 +249,9 @@ def _order_history_rows(records: list[dict]) -> list[dict]:
             "order_id": leg.get("order_id"),
             "status": leg.get("status"),
             "filled_size": leg.get("filled_size"),
+            "average_fill_price": leg.get("average_fill_price"),
+            "average_fee_paid": leg.get("average_fee_paid"),
+            "market_url": _kalshi_market_url(leg.get("ticker")),
             "error": leg.get("error"),
         }
         for r in records
@@ -221,251 +259,323 @@ def _order_history_rows(records: list[dict]) -> list[dict]:
     ]
 
 
+def _kalshi_market_url(ticker: Optional[str]) -> Optional[str]:
+    """Stable Kalshi web redirect for a market ticker."""
+    return f"https://kalshi.com/markets_by_ticker/{ticker.lower()}" if ticker else None
+
+
+def _filled_trade_rows(records: list[dict]) -> list[dict]:
+    """One row per basket order attempt (kind == "basket") that actually got
+    at least one contract filled on Kalshi — i.e. a real trade, not just a
+    placement attempt. Unwind legs (kind == "unwind") are excluded: they're
+    the safety net flattening an uneven fill, not the original arbitrage
+    trade, and their P&L is already netted into what the basket legs above
+    them actually captured.
+
+    filled_size is the MINIMUM fill across the basket's legs, not the sum
+    or any single leg's fill — a basket only locks in its edge on the
+    contracts where every leg filled; if legs filled unevenly the excess on
+    the better-filled leg(s) is what triggers the unwind logged separately.
+    expected_profit_usd is that filled_size times the per-contract edge
+    recorded at placement time (edge_usd_per_contract), i.e. what this
+    trade is expected to net before Kalshi's settlement, not counting any
+    unwind cost if the fill was uneven.
+    """
+    rows = []
+    for r in records:
+        if r.get("kind", "basket") != "basket":
+            continue
+        legs = r.get("legs", [])
+        if not legs:
+            continue
+        filled_sizes = [Decimal(leg["filled_size"]) for leg in legs if leg.get("filled_size") is not None]
+        if not filled_sizes:
+            continue
+        filled_size = min(filled_sizes)
+        if filled_size <= 0:
+            continue
+        edge_per_contract = Decimal(r["edge_usd_per_contract"]) if r.get("edge_usd_per_contract") is not None else None
+        actual_expected = Decimal(r["actual_expected_profit_usd"]) if r.get("actual_expected_profit_usd") is not None else None
+        rows.append({
+            "placed_at": r.get("placed_at"),
+            "target": r.get("target", "demo"),
+            "event_ticker": r.get("event_ticker"),
+            "direction": r.get("direction"),
+            "legs": len(legs),
+            "filled_size": float(filled_size),
+            "edge_usd_per_contract": float(edge_per_contract) if edge_per_contract is not None else None,
+            "expected_profit_usd": float(actual_expected) if actual_expected is not None else (float(edge_per_contract * filled_size) if edge_per_contract is not None else None),
+            "economics_source": "Actual fills + fees" if actual_expected is not None else "Detected estimate",
+            "fill_quality": "Matched" if len(set(filled_sizes)) == 1 else "Partial / unwound",
+            "order_ids": ", ".join(str(leg["order_id"]) for leg in legs if leg.get("order_id")),
+            "kalshi_market": _kalshi_market_url(legs[0].get("ticker")),
+        })
+    return rows
+
+
 def main() -> None:
     settings = load_settings()
+    st.title("Kalshi Arbitrage Control Room")
+    st.caption("Read-only operational view · execution remains exclusively in scripts/run_scanner.py")
 
-    st.title("Kalshi Same-Day Rebalancing Arb — Live View")
-    st.caption(
-        "Stage 1 (same-day mutually-exclusive events) + Stage 2 (live per-leg order books) "
-        "from the kalshi_market_rebalancing_arbitrage_live scanner. Read-only — never places orders."
-    )
+    header_left, header_mid, header_right = st.columns([2, 1, 1])
+    with header_left:
+        auto_refresh_live_views = st.toggle(
+            "Live refresh (5s)", value=False,
+            help="Refreshes local status and history files only; it does not call Kalshi or place orders.",
+        )
+    with header_mid:
+        st.link_button("Open Kalshi portfolio ↗", "https://kalshi.com/portfolio", width="stretch")
+    with header_right:
+        if st.button("Refresh dashboard", width="stretch"):
+            st.rerun()
 
-    st.subheader("Production scanner status")
+    st.subheader("System status")
     status = _load_status(settings.logging.status_path)
     if status is None:
-        st.warning(
-            "scripts/run_scanner.py hasn't written a status file yet — either it's never been run, "
-            f"or {settings.logging.status_path} doesn't exist. Nothing below reflects a live process."
-        )
+        st.warning("Scanner status is unavailable. Execution should be treated as offline.")
+        badge, age_s = "🔴 Offline", None
     else:
         updated_at = datetime.fromisoformat(status["updated_at"])
         age_s = (datetime.now(timezone.utc) - updated_at).total_seconds()
         rescan_interval_s = status.get("rescan_interval_s", settings.scanner.rescan_interval_s)
-        # "Live" within a few heartbeats (_HEARTBEAT_MIN_INTERVAL_S=5 in
-        # stream/monitor.py); "stale" up to one missed rescan cycle — beyond
-        # that the process is either idle-with-no-candidates (which still
-        # writes fresh status) or actually dead.
         if age_s < 20:
             badge = "🟢 Live"
         elif age_s < rescan_interval_s * 2:
             badge = "🟡 Stale"
         else:
-            badge = "🔴 Not responding"
+            badge = "🔴 Offline"
 
         if status.get("circuit_breaker_tripped"):
-            st.error(
-                f"🛑 Circuit breaker tripped — execution auto-disabled. {status.get('circuit_breaker_reason', '')}",
-                icon="🛑",
-            )
+            st.error(f"Circuit breaker tripped: {status.get('circuit_breaker_reason', 'No reason recorded')}", icon="🛑")
 
         position_mismatches = status.get("position_reconciliation_mismatches") or {}
         if position_mismatches:
             st.error(
-                "⚠️ Position reconciliation mismatch — our records disagree with Kalshi's actual positions: "
+                "Position reconciliation mismatch: "
                 + ", ".join(f"{t} (believed {m['believed']}, actual {m['actual']})" for t, m in position_mismatches.items()),
                 icon="⚠️",
             )
 
-        sc1, sc2, sc3, sc4, sc5 = st.columns(5)
+        risk = status.get("risk") or {}
+        # getattr keeps Streamlit hot reload compatible with a process that
+        # imported the older ExecutionSettings shape before `target` existed.
+        execution_target = status.get("execution_target") or getattr(settings.execution, "target", "demo")
+        target_label = "PROD · REAL MONEY" if execution_target == "prod" else "Demo"
+        sc1, sc2, sc3, sc4, sc5, sc6 = st.columns(6)
         sc1.metric("Status", badge)
-        sc2.metric("Stage 1 candidates", status.get("stage1_candidates", "—"))
-        sc3.metric("...with recent activity", status.get("active_candidates", "—"))
-        sc4.metric("Watching via WS", f"{status.get('ws_shortlist_events', '—')} events / {status.get('ws_shortlist_legs', '—')} legs")
-        sc5.metric("Open opportunities", status.get("open_opportunities", 0))
-
+        sc2.metric("Account", target_label)
+        sc3.metric("WS events", status.get("ws_shortlist_events", "—"))
+        sc4.metric("Open signals", status.get("open_opportunities", 0))
+        sc5.metric("Gross exposure", f"${Decimal(str(risk.get('gross_exposure_usd', 0))):.2f}")
+        sc6.metric("Daily loss", f"${Decimal(str(risk.get('daily_realized_loss_usd', 0))):.2f}")
         st.caption(
-            f"Phase: {status.get('phase', 'unknown')} · WS connected: {status.get('ws_connected')} · "
-            f"Execution (demo orders) enabled: {status.get('execution_enabled')} · "
-            f"Pending capital allocation: {status.get('pending_execution', 0)} "
-            "(open opportunities not yet executed — awaiting capital or a ranking re-check, see execution/capital.py) · "
-            f"Updated {age_s:.0f}s ago ({updated_at.strftime('%Y-%m-%d %H:%M:%S')} UTC)"
+            f"{status.get('phase', 'unknown')} · WS {'connected' if status.get('ws_connected') else 'disconnected'} · "
+            f"execution {'armed' if status.get('execution_enabled') else 'disabled'} · "
+            f"daily notional reserve ${Decimal(str(risk.get('daily_notional_usd', 0))):.2f} · "
+            f"attempts {risk.get('daily_basket_attempts', 0)}/{risk.get('max_baskets_per_day', '—')} daily, "
+            f"{risk.get('session_basket_attempts', 0)}/{risk.get('max_baskets_per_session', '—')} session · "
+            f"updated {age_s:.0f}s ago"
         )
-
-        watched = status.get("watched_events", [])
-        if watched:
-            with st.expander(f"Events currently subscribed via WebSocket ({len(watched)})"):
-                watched_df = pd.DataFrame(watched).sort_values("volume_24h", ascending=False)
-                st.dataframe(
-                    watched_df,
-                    width="stretch",
-                    hide_index=True,
-                    column_config={
-                        "event_ticker": "Event",
-                        "title": "Title",
-                        "legs": st.column_config.NumberColumn("Legs"),
-                        "volume_24h": st.column_config.NumberColumn("24h volume"),
-                    },
-                )
-
-    auto_refresh_live_views = st.checkbox(
-        "Auto-refresh scanner status & history every 5s", value=False,
-        help="Both read local files only (no Kalshi API calls), so this is safe to leave on.",
-    )
-
-    st.divider()
-    st.subheader("On-demand REST snapshot")
-    col_refresh, col_status = st.columns([1, 5])
-    with col_refresh:
-        refresh = st.button("🔄 Refresh", type="primary")
-
-    if refresh or "last_scan" not in st.session_state:
-        with st.spinner("Fetching open events + order books from Kalshi..."):
-            try:
-                total_open, candidates, active_candidates, legs = asyncio.run(_run_scan(settings))
-            except ExchangeError as exc:
-                st.error(f"Kalshi request failed: {exc}")
-                st.stop()
-            st.session_state.last_scan = (total_open, candidates, active_candidates, legs)
-            st.session_state.last_refreshed = datetime.now(timezone.utc)
-
-    with col_status:
-        st.caption(f"Last refreshed: {st.session_state.last_refreshed.strftime('%Y-%m-%d %H:%M:%S')} UTC")
-
-    total_open, candidates, active_candidates, legs = st.session_state.last_scan
-    legs_by_event: dict[str, list[LegSnapshot]] = {}
-    for leg in legs:
-        legs_by_event.setdefault(leg.event_ticker, []).append(leg)
-
-    rows = _event_rows(active_candidates, legs_by_event, settings)
-    opportunities = [r for r in rows if r["opportunity"] != "-"]
-
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Open events (Kalshi)", total_open)
-    m2.metric("Stage 1 — same-day mutually exclusive", len(candidates))
-    m3.metric("...with recent trading activity", len(active_candidates))
-    m4.metric("Individual markets watched", sum(len(c.leg_tickers) for c in active_candidates))
-    m5.metric("Arb opportunities right now", len(opportunities))
-
-    st.subheader("Stage 1 — events (with recent trading activity)")
-    st.caption(
-        f"{len(candidates)} events settle by midnight UTC tonight; {len(candidates) - len(active_candidates)} "
-        "of those are skipped here (no order book fetched) for having zero 24h volume on at least one leg — "
-        "the same ghost-spread gate scanner/orderbook_scan.py's Stage 2 applies before ever pricing a basket."
-    )
-    if rows:
-        df = pd.DataFrame(rows).sort_values("buy_cost_usd", na_position="last")
-        st.dataframe(
-            df,
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "event_ticker": "Event",
-                "title": "Title",
-                "legs": st.column_config.NumberColumn("Legs"),
-                "missing_quotes": st.column_config.NumberColumn("Missing quotes"),
-                "settles_utc": "Settles (UTC)",
-                "buy_cost_usd": st.column_config.ProgressColumn(
-                    "Buy basket cost", min_value=0.0, max_value=1.10, format="$%.3f",
-                ),
-                "opportunity": "Opportunity",
-                "edge_usd": st.column_config.NumberColumn("Edge", format="$%.3f"),
-            },
-        )
-        st.caption(
-            f"Flags below ${settings.arb.buy_basket_max_cost_usd} · "
-            f"needs ≥{settings.scanner.min_depth_contracts} contracts on every leg's thinnest side. "
-            "Buy-basket only — see README.md."
-        )
-    else:
-        st.info("No open events currently settle by midnight UTC tonight with a mutually-exclusive, 2-6 leg structure.")
-
-    st.subheader("Individual markets (legs)")
-    if active_candidates:
-        event_options = {f"{c.event_ticker} — {c.title}": c.event_ticker for c in active_candidates}
-        chosen_label = st.selectbox("Filter by event", ["All events"] + list(event_options.keys()))
-        chosen_ticker = event_options.get(chosen_label)
-
-        leg_rows = []
-        for c in active_candidates:
-            if chosen_ticker and c.event_ticker != chosen_ticker:
-                continue
-            for leg in legs_by_event.get(c.event_ticker, []):
-                leg_rows.append({
-                    "event_ticker": leg.event_ticker,
-                    "ticker": leg.ticker,
-                    "best_bid": float(leg.best_bid) if leg.best_bid is not None else None,
-                    "bid_size": float(leg.bid_size) if leg.bid_size is not None else None,
-                    "best_ask": float(leg.best_ask) if leg.best_ask is not None else None,
-                    "ask_size": float(leg.ask_size) if leg.ask_size is not None else None,
-                    "error": leg.error or "",
-                })
-
-        st.dataframe(
-            pd.DataFrame(leg_rows),
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "event_ticker": "Event",
-                "ticker": "Market",
-                "best_bid": st.column_config.NumberColumn("Best bid", format="$%.2f"),
-                "bid_size": st.column_config.NumberColumn("Bid size"),
-                "best_ask": st.column_config.NumberColumn("Best ask", format="$%.2f"),
-                "ask_size": st.column_config.NumberColumn("Ask size"),
-                "error": "Error",
-            },
-        )
-    else:
-        st.info("No individual markets to show — no events passed Stage 1.")
-
-    st.divider()
-    st.subheader("History — from the running production scanner")
-    st.caption(
-        "Tailed from data/opportunities.jsonl and data/orders.jsonl, written by "
-        "stream/monitor.py's WS loop (scripts/run_scanner.py) — independent of the "
-        "Refresh button above, and empty until that process has run at least once."
-    )
 
     opp_records = _load_jsonl(settings.logging.opportunities_log_path)
     order_records = _load_jsonl(settings.execution.orders_log_path)
     total_order_legs = sum(len(r.get("legs", [])) for r in order_records)
+    filled_rows = _filled_trade_rows(order_records)
 
-    hist_col1, hist_col2 = st.columns(2)
-    with hist_col1:
-        st.markdown(f"**Opportunities detected** ({len(opp_records)})")
+    trades_tab, signals_tab, snapshot_tab, diagnostics_tab = st.tabs(
+        ["Executed trades", "Detected opportunities", "Market snapshot", "Diagnostics"]
+    )
+
+    with trades_tab:
+        st.subheader("Trades sent to Kalshi")
+        st.caption(
+            "Expected profit applies only to the equal quantity filled across every basket leg. "
+            "Partial/unwound rows can still realize an unwind loss. Click Market to open the contract on Kalshi; "
+            "use the order ID to locate the exact private order in your portfolio history."
+        )
+        if filled_rows:
+            prod_rows = [row for row in filled_rows if row["target"] == "prod"]
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Completed baskets", len(filled_rows))
+            c2.metric("Real-money baskets", len(prod_rows))
+            c3.metric("Matched contracts", f"{sum(row['filled_size'] for row in filled_rows):.2f}")
+            c4.metric("Expected settlement profit", f"${sum(row['expected_profit_usd'] or 0 for row in filled_rows):.2f}")
+            st.dataframe(
+                pd.DataFrame(filled_rows).sort_values("placed_at", ascending=False),
+                width="stretch", hide_index=True,
+                column_config={
+                    "placed_at": "Placed (UTC)", "target": "Account", "event_ticker": "Event",
+                    "direction": None, "legs": st.column_config.NumberColumn("Legs"),
+                    "filled_size": st.column_config.NumberColumn("Matched size", format="%.2f"),
+                    "edge_usd_per_contract": st.column_config.NumberColumn("Expected edge / contract", format="$%.4f"),
+                    "expected_profit_usd": st.column_config.NumberColumn("Expected profit", format="$%.4f"),
+                    "economics_source": "Profit basis",
+                    "fill_quality": "Execution", "order_ids": "Kalshi order IDs",
+                    "kalshi_market": st.column_config.LinkColumn("Market ↗", display_text="Open on Kalshi"),
+                },
+            )
+        else:
+            st.info("No complete basket has filled on every leg yet.")
+
+        with st.expander(f"All order attempts ({len(order_records)} batches / {total_order_legs} legs)"):
+            if order_records:
+                st.dataframe(
+                    pd.DataFrame(_order_history_rows(order_records)).sort_values("placed_at", ascending=False),
+                    width="stretch", hide_index=True,
+                    column_config={
+                        "placed_at": "Placed (UTC)", "kind": "Type", "execution_stage": "Stage", "target": "Account",
+                        "event_ticker": "Event", "direction": None, "ticker": "Market ticker",
+                        "action": "Action", "limit_price": st.column_config.NumberColumn("Limit", format="$%.4f"),
+                        "size": st.column_config.NumberColumn("Requested"), "order_id": "Order ID",
+                        "status": "Status", "filled_size": st.column_config.NumberColumn("Filled"),
+                        "average_fill_price": st.column_config.NumberColumn("Avg fill", format="$%.4f"),
+                        "average_fee_paid": st.column_config.NumberColumn("Fee / contract", format="$%.4f"),
+                        "market_url": st.column_config.LinkColumn("Market ↗", display_text="Open"), "error": "Error",
+                    },
+                )
+            else:
+                st.info("No orders have been submitted.")
+
+    with signals_tab:
+        st.subheader(f"Detected opportunities ({len(opp_records)})")
+        st.caption("Signals are not trades. They may disappear before execution or be rejected by risk controls.")
         if opp_records:
             df = pd.DataFrame(_opportunity_history_rows(opp_records)).sort_values("detected_at", ascending=False)
             st.dataframe(
-                df,
-                width="stretch",
-                hide_index=True,
+                df, width="stretch", hide_index=True,
                 column_config={
-                    "detected_at": "Detected (UTC)",
-                    "event_ticker": "Event",
-                    "direction": "Direction",
-                    "legs": "Legs",
+                    "detected_at": "Detected (UTC)", "event_ticker": "Event", "direction": None,
+                    "leg_count": st.column_config.NumberColumn("Legs", format="%d"),
+                    "sum_ask_usd": st.column_config.NumberColumn("Sum of asks", format="$%.3f"),
+                    "fees_usd": st.column_config.NumberColumn("Fees", format="$%.3f"),
                     "basket_price_usd": st.column_config.NumberColumn("Basket price", format="$%.3f"),
-                    "edge_usd": st.column_config.NumberColumn("Edge", format="$%.3f"),
-                    "max_size": st.column_config.NumberColumn("Max size"),
+                    "edge_usd": st.column_config.NumberColumn("Expected edge", format="$%.3f"),
+                    "max_size": st.column_config.NumberColumn("Displayed max size"),
+                    "thinnest_leg_size": st.column_config.NumberColumn("Thinnest leg", format="%.2f"),
+                    "widest_leg_spread": st.column_config.NumberColumn("Widest spread", format="$%.3f"),
                 },
             )
-        else:
-            st.info(f"No opportunities recorded yet at {settings.logging.opportunities_log_path}.")
 
-    with hist_col2:
-        st.markdown(f"**Orders placed (demo)** ({len(order_records)} baskets / {total_order_legs} legs)")
-        if order_records:
-            df = pd.DataFrame(_order_history_rows(order_records)).sort_values("placed_at", ascending=False)
-            st.dataframe(
-                df,
-                width="stretch",
-                hide_index=True,
-                column_config={
-                    "placed_at": "Placed (UTC)",
-                    "kind": "Kind",
-                    "event_ticker": "Event",
-                    "direction": "Direction",
-                    "ticker": "Market",
-                    "action": "Action",
-                    "limit_price": st.column_config.NumberColumn("Limit price", format="$%.2f"),
-                    "size": st.column_config.NumberColumn("Size"),
-                    "order_id": "Order ID",
-                    "status": "Status",
-                    "filled_size": st.column_config.NumberColumn("Filled"),
-                    "error": "Error",
-                },
+            st.markdown("##### Price per leg")
+            st.caption(
+                "The basket price is the sum of every leg's ask plus Kalshi's fee on each. "
+                "Pick a detection to see which leg carried the edge and how much depth backed it."
             )
+            labelled = sorted(
+                enumerate(opp_records),
+                key=lambda pair: pair[1].get("detected_at") or "",
+                reverse=True,
+            )
+            options = [
+                f"{r.get('detected_at', '?')[11:19]} · {r.get('event_ticker', '?')} · "
+                f"edge ${Decimal(str(r.get('edge_usd', 0))):.3f}"
+                for _, r in labelled
+            ]
+            chosen = st.selectbox("Detection", options, index=0, key="opp_leg_pick")
+            selected = labelled[options.index(chosen)][1]
+            leg_rows = _opportunity_leg_rows(selected)
+            if leg_rows:
+                st.dataframe(
+                    pd.DataFrame(leg_rows), width="stretch", hide_index=True,
+                    column_config={
+                        "ticker": "Leg",
+                        "ask": st.column_config.NumberColumn("Ask (you pay)", format="$%.4f"),
+                        "ask_size": st.column_config.NumberColumn("Ask size", format="%.2f"),
+                        "bid": st.column_config.NumberColumn("Bid (exit)", format="$%.4f"),
+                        "bid_size": st.column_config.NumberColumn("Bid size", format="%.2f"),
+                        "spread": st.column_config.NumberColumn("Spread", format="$%.4f"),
+                        "market_url": st.column_config.LinkColumn("Market", display_text="open"),
+                    },
+                )
+                sum_ask = sum(Decimal(str(q["ask"])) for q in leg_rows)
+                fees = Decimal(str(selected.get("fees_usd", 0)))
+                st.caption(
+                    f"sum of asks ${sum_ask:.4f} + fees ${fees:.4f} = "
+                    f"${sum_ask + fees:.4f} basket cost, against a $1.00 payout "
+                    f"→ edge ${Decimal(1) - sum_ask - fees:.4f} per contract"
+                )
+            else:
+                st.info(
+                    "This detection predates per-leg quote logging. Newer detections show "
+                    "each leg's ask, bid and depth here."
+                )
         else:
-            st.info(f"No orders recorded yet at {settings.execution.orders_log_path}.")
+            st.info("No opportunities recorded.")
+
+    with snapshot_tab:
+        st.subheader("On-demand market snapshot")
+        st.caption("This performs public REST calls and is independent of the scanner's live WebSocket state.")
+        refresh_snapshot = st.button("Fetch fresh snapshot", type="primary")
+        if refresh_snapshot:
+            with st.spinner("Fetching events and order books..."):
+                try:
+                    st.session_state.last_scan = asyncio.run(_run_scan(settings))
+                    st.session_state.last_refreshed = datetime.now(timezone.utc)
+                except ExchangeError as exc:
+                    st.error(f"Kalshi request failed: {exc}")
+        if "last_scan" in st.session_state:
+            total_open, candidates, active_candidates, legs = st.session_state.last_scan
+            legs_by_event: dict[str, list[LegSnapshot]] = {}
+            for leg in legs:
+                legs_by_event.setdefault(leg.event_ticker, []).append(leg)
+            rows = _event_rows(active_candidates, legs_by_event, settings)
+            opportunities = [row for row in rows if row["opportunity"] != "-"]
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Open events", total_open)
+            c2.metric("Eligible active events", len(active_candidates))
+            c3.metric("Snapshot opportunities", len(opportunities))
+            st.caption(f"Snapshot taken {st.session_state.last_refreshed.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+            if rows:
+                st.dataframe(
+                    pd.DataFrame(rows).sort_values("buy_cost_usd", na_position="last"),
+                    width="stretch", hide_index=True,
+                    column_config={
+                        "event_ticker": "Event", "title": "Title", "legs": "Legs",
+                        "missing_quotes": "Missing", "settles_utc": "Settles UTC",
+                        "buy_cost_usd": st.column_config.NumberColumn("Basket cost", format="$%.4f"),
+                        "opportunity": "Signal", "edge_usd": st.column_config.NumberColumn("Edge", format="$%.4f"),
+                    },
+                )
+        else:
+            st.info("Click Fetch fresh snapshot when you need a manual market check.")
+
+    with diagnostics_tab:
+        st.subheader("Scanner diagnostics")
+        if status is not None:
+            diagnostics = status.get("detection_diagnostics") or {}
+            d1, d2, d3, d4 = st.columns(4)
+            d1.metric("Fully priced evaluations", diagnostics.get("fully_priced_evaluations", 0))
+            d2.metric("Rejected on price", diagnostics.get("price_threshold_rejections", 0))
+            d3.metric("Rejected as stale", diagnostics.get("stale_book_rejections", 0))
+            d4.metric("Active events omitted", status.get("active_events_omitted_from_ws", 0))
+            st.caption(
+                f"Incomplete books: {diagnostics.get('incomplete_book_rejections', 0)} · "
+                f"insufficient depth: {diagnostics.get('insufficient_depth_rejections', 0)} · "
+                f"incoherent books: {diagnostics.get('incoherent_book_rejections', 0)} · "
+                f"active legs {status.get('ws_shortlist_legs', 0)}/{status.get('active_legs_total', '—')} subscribed"
+            )
+            closest = diagnostics.get("closest_baskets") or []
+            if closest:
+                st.markdown("**Closest baskets observed this connection (fees included)**")
+                st.dataframe(
+                    pd.DataFrame(closest), width="stretch", hide_index=True,
+                    column_config={
+                        "event_ticker": "Event",
+                        "basket_cost_usd": st.column_config.NumberColumn("Basket cost", format="$%.4f"),
+                        "distance_to_threshold_usd": st.column_config.NumberColumn("Above/below trigger", format="$%.4f"),
+                        "minimum_ask_depth": st.column_config.NumberColumn("Minimum depth"),
+                        "legs": st.column_config.NumberColumn("Legs"),
+                    },
+                )
+            watched = status.get("watched_events", [])
+            if watched:
+                st.markdown(f"**WebSocket subscriptions ({len(watched)} events)**")
+                st.dataframe(pd.DataFrame(watched).sort_values("volume_24h", ascending=False), width="stretch", hide_index=True)
+            with st.expander("Raw scanner status"):
+                st.json(status)
+        st.caption(f"Opportunity log: {settings.logging.opportunities_log_path}")
+        st.caption(f"Order log: {settings.execution.orders_log_path}")
 
     if auto_refresh_live_views:
         time.sleep(5)

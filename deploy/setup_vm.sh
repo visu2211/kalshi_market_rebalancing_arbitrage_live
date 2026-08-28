@@ -55,6 +55,8 @@ if [ ! -f "$DEPLOY_DIR/.env" ]; then
     cp .env.example .env
 fi
 mkdir -p "$DEPLOY_DIR/data" "$DEPLOY_DIR/secrets"
+chmod 600 "$DEPLOY_DIR/.env"
+chmod 700 "$DEPLOY_DIR/secrets"
 
 echo "==> Installing systemd service..."
 sed -e "s#__DEPLOY_USER__#$(whoami)#g" -e "s#__DEPLOY_DIR__#$DEPLOY_DIR#g" \

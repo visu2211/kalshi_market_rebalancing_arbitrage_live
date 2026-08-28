@@ -8,18 +8,19 @@
 # project's scanner.max_days_to_close.
 
 kalshi:
-  base_url: "https://api.elections.kalshi.com/trade-api/v2"
-  ws_url: "wss://api.elections.kalshi.com/trade-api/ws/v2"
+  base_url: "https://external-api.kalshi.com/trade-api/v2"
+  ws_url: "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
   request_timeout_s: 10
   max_retries: 3
 
 scanner:
   min_outcome_legs: 2                   # Stage 1: N floor
   max_outcome_legs: 6                   # Stage 1: N cap
-  min_depth_contracts: 25               # Stage 2: reject if the thinnest leg has less size than this
+  min_depth_contracts: 1                # one-contract canary: require the quantity execution can actually submit, not an unrelated 25-contract floor
   rescan_interval_s: 300                # how often Stage 1 re-runs to refresh Stage 3's WS subscription set (5 min — Kalshi's public GET endpoints aren't metered, and a full pass takes seconds, well under this)
   orderbook_depth: 5                    # book depth to request per leg in Stage 2's --once REST summary (only need top-of-book)
-  max_ws_legs: 200                      # Stage 3: WS subscription budget (individual market tickers) — scanner.filters.select_by_volume fills this with the highest-24h-volume same-day events first
+  max_ws_legs: 1000                     # normally covers the full active same-day universe; status reports events omitted if this ceiling is reached
+  max_quote_age_ms: 300000              # ordered WS deltas keep unchanged books current; reconnect/gap invalidation and the 5-minute snapshot rebuild are the freshness boundaries
 
 arb:
   buy_basket_max_cost_usd: 0.98         # sum(ask_i) + sum(fee_i) must be below this to flag a buy-basket opportunity — the only direction implemented, see scanner/basket.py
@@ -30,7 +31,25 @@ logging:
   status_path: "data/scanner_status.json"              # overwritten each cycle/heartbeat — what stream/monitor.py is currently watching; read by ui/app.py
 
 execution:
-  enabled: true                                                 # re-armed 2026-08-26 after batching + all-or-nothing unwind + confirmation + position reconciliation + circuit breaker (execution/executor.py, stream/monitor.py). History (data/opportunities.jsonl, data/orders.jsonl) reset to empty the same day, so everything from here on reflects this configuration.
-  demo_base_url: "https://demo-api.kalshi.co/trade-api/v2"       # separate account/book from kalshi.base_url above — see execution/executor.py
+  enabled: true                                                 # ARMED 2026-08-28 for demo-account execution — target below is still "demo" (paper money)
+  target: "prod"                                                # "demo" (paper money) or "prod" (REAL MONEY, real Kalshi account — see execution/executor.py's module docstring before ever setting this to prod)
+  demo_base_url: "https://external-api.demo.kalshi.co/trade-api/v2" # separate account/book from kalshi.base_url above — see execution/executor.py
   orders_log_path: "data/orders.jsonl"                          # append-only, one JSON line per leg order attempt ("kind": "basket" or "unwind")
-  circuit_breaker_max_mismatches: 2                             # consecutive leg-mismatched baskets before auto-disabling execution for the rest of the process — see stream/monitor.py's _CircuitBreaker
+  risk_state_path: "data/risk_state.json"                       # durable breaker, exposure, and bot-owned position/order state
+  circuit_breaker_max_mismatches: 1                             # first leg mismatch durably disables execution
+  max_order_size_contracts: 1                                   # caps every leg's requested size regardless of the opportunity's computed max_size — deliberately small (2026-08-26: first-ever real-money capability, ramp up from here manually, not automatically)
+  require_rest_confirmation: true                               # DEMO-ONLY OPT-OUT (2026-08-28). Normally true: re-read every leg from Kalshi's own book and submit off those prices. Set false here because 13 of 13 detections were refused by confirmation, so no order ever reached the exchange — and an edge lasting less than one round trip can never be corroborated by a second round trip, making the gate unable to distinguish "no edge" from "never tested". config/loader.py REFUSES to load with target: prod while this is false.
+  prod_unconfirmed_orders_acknowledged: false                    # 2026-08-28: deliberate. REST confirmation refused 13/13 detections, so no order ever reached the exchange and the run could not distinguish "no edge" from "never tested". Submitting on WS prices to obtain one ground-truth fill. Bounded: 1 contract, 3 attempts, breaker trips on first mismatch, $23 account.
+  prod_enabled: true                                            # first production opt-in; production also requires account/env/webhook safeguards and CLI confirmation
+  max_gross_exposure_usd: 25                                    # hard account-wide strategy exposure ceiling
+  max_event_exposure_usd: 5                                     # hard exposure ceiling for a single event
+  max_daily_notional_usd: 50                                    # conservative UTC-day turnover reserve: entry cost plus worst-case full unwind turnover
+  max_daily_loss_usd: 3                                         # hard UTC-day realized loss ceiling
+  max_open_orders: 12                                           # maximum bot-owned orders that may remain open
+  max_orders_per_minute: 20                                     # submission-rate ceiling, including unwind orders
+  max_baskets_per_session: 3                                    # canary-first: at most one basket attempt per process
+  max_baskets_per_day: 3                                        # durable UTC-day attempt ceiling across restarts
+  event_cooldown_s: 86400                                       # durable no-retry window per exact event
+  max_unwind_loss_usd: 0.25                                     # reject unless observed exit depth bounds a full partial-fill unwind to this loss. Raised from 0.10 on 2026-08-28: at max_order_size_contracts=1 Kalshi's per-order fee rounding alone costs 0.04-0.12 per basket, so 0.10 was unreachable — every live detection was refused (observed 0.11 and 0.15 estimates). Revisit alongside the size cap before prod; a larger size amortizes the rounding and lowers this estimate for the same basket.
+  process_lock_path: "data/execution.lock"                      # prevents concurrent armed scanner processes
+  alerts_log_path: "data/alerts.jsonl"                         # local incident stream; prod also requires Telegram or a generic webhook

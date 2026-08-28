@@ -53,6 +53,38 @@ class RateLimitError(ExchangeError):
     """Kalshi rate limit hit; caller should back off."""
 
 
+class ServerError(ExchangeError):
+    """Kalshi returned 5xx — transient on the exchange's side, so safe to
+    retry for reads. Deliberately NOT raised for a mutating signed request:
+    a 502 on an order POST may mean the order was accepted and only the
+    response was lost, so retrying it is a duplicate-submission risk that
+    client_order_id idempotency should not be relied on alone to absorb."""
+
+
+class AmbiguousSubmissionError(ExchangeError):
+    """A mutating request (order placement or cancellation) failed in a way
+    that does NOT establish whether the exchange applied it.
+
+    This is the distinction the client previously could not express, and
+    collapsing it into "the request failed, so nothing happened" is the most
+    dangerous default available: a lost entry response looks like a clean
+    no-fill while real positions sit open, and a lost unwind response invites
+    a second unwind that oversells.
+
+    Raised for a mutation that hits a transport timeout/reset (the request may
+    have reached the matching engine) or a 5xx (the engine may have processed
+    it before failing to answer). NEVER retried automatically — the caller
+    must resolve it by querying the submitted client_order_id values and
+    reconciling against what the exchange actually holds. A clean rejection
+    (4xx, 429) is not ambiguous and does not use this type.
+    """
+
+    def __init__(self, message: str, client_order_ids: list[str] | None = None) -> None:
+        super().__init__(message)
+        # The exact ids to look up when resolving what actually happened.
+        self.client_order_ids = list(client_order_ids or [])
+
+
 class OrderRejectedError(ExchangeError):
     """Exchange rejected the order at submission time (e.g. insufficient_balance)."""
 
@@ -71,10 +103,17 @@ class OrderType(str, Enum):
     LIMIT = "limit"   # only mode implemented — see place_order
 
 
+class TimeInForce(str, Enum):
+    GOOD_TILL_CANCELED = "good_till_canceled"
+    IMMEDIATE_OR_CANCEL = "immediate_or_cancel"
+    FILL_OR_KILL = "fill_or_kill"
+
+
 class OrderStatus(str, Enum):
-    OPEN = "open"                          # resting on the book
+    OPEN = "open"                          # still resting on the book, remaining_size > 0
     PARTIALLY_FILLED = "partially_filled"
     FILLED = "filled"
+    CANCELED = "canceled"                  # zero fill AND nothing left resting — distinct from OPEN, added 2026-08-26 after CANCELED-with-zero-remaining was being mislabeled OPEN
     REJECTED = "rejected"
 
 
@@ -87,7 +126,9 @@ class OrderRequest:
     size: Decimal                               # contracts
     limit_price: Decimal                        # required for LIMIT — the only order_type implemented
     client_order_id: Optional[str] = None       # idempotency key; auto-generated if omitted
-    expiration_ts: Optional[int] = None         # unix seconds; see place_order's IOC note
+    time_in_force: TimeInForce = TimeInForce.GOOD_TILL_CANCELED
+    expiration_ts: Optional[int] = None         # compatibility name; serialized as V2 `expiration_time`
+    tick_size: Decimal = Decimal("0.0001")      # V2 fixed-point precision; override from market price_ranges
 
 
 @dataclass
@@ -98,6 +139,7 @@ class OrderResult:
     filled_size: Decimal
     remaining_size: Decimal
     average_fill_price: Optional[Decimal]
+    average_fee_paid: Optional[Decimal] = None
     raw: dict = field(default_factory=dict)     # untouched exchange response, for debugging
 
 
@@ -128,12 +170,31 @@ class Orderbook:
 # terminal — retrying won't fix it, and reraise=True means the ORIGINAL
 # exception surfaces after retries are exhausted rather than tenacity's
 # RetryError wrapper.
+# Backoff sized to Kalshi's token buckets, not guessed. A 429 carries no
+# penalty or cooldown: the bucket keeps refilling and the next request succeeds
+# as soon as the balance covers the cost. On the Basic tier (read 200 tokens/s,
+# default cost 10) a GET is affordable again ~50ms after a 429 — the previous
+# 500ms floor was ~10x longer than needed, and long enough to push a REST
+# confirmation past its 1s freshness bound (observed live: a 1.585s
+# confirmation that was rejected as stale). Transport errors reuse the same
+# schedule; they are rarer and the extra attempts still cap out quickly.
 _transient_retry = retry(
-    retry=retry_if_exception_type((httpx.TransportError, RateLimitError)),
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=0.5, min=0.5, max=5),
+    retry=retry_if_exception_type((httpx.TransportError, RateLimitError, ServerError)),
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=0.05, min=0.05, max=1.0),
     reraise=True,
 )
+
+
+def _client_order_ids_in(json_body: Optional[dict]) -> list[str]:
+    """Pulls every client_order_id out of a single-order or batched body, so an
+    ambiguous submission can name exactly what needs looking up."""
+    if not json_body:
+        return []
+    if "orders" in json_body and isinstance(json_body["orders"], list):
+        return [o["client_order_id"] for o in json_body["orders"] if o.get("client_order_id")]
+    coid = json_body.get("client_order_id")
+    return [coid] if coid else []
 
 
 def sign_kalshi_request(private_key: rsa.RSAPrivateKey, timestamp_ms: str, method: str, full_path: str) -> str:
@@ -197,11 +258,66 @@ class KalshiClient:
         resp = await self._client().get(path, params=params)
         if resp.status_code == 429:
             raise RateLimitError(f"Kalshi rate limit hit on GET {path}")
-        resp.raise_for_status()
-        return resp.json()
+        # Every caller in this project handles ExchangeError and nothing else.
+        # raise_for_status() used to leak httpx.HTTPStatusError straight past
+        # those handlers, so a routine Kalshi 5xx killed the whole scanner loop
+        # rather than being retried or skipped.
+        if resp.status_code >= 500:
+            raise ServerError(f"Kalshi server error on GET {path}: {resp.status_code}")
+        if resp.status_code >= 400:
+            raise ExchangeError(f"Kalshi rejected GET {path}: {resp.status_code} {resp.text[:200]}")
+        try:
+            return resp.json()
+        except ValueError as exc:
+            # A proxy/CDN error page in front of the API is still a 200 sometimes.
+            raise ExchangeError(f"Kalshi returned a non-JSON body for GET {path}") from exc
+
+    async def _signed_request(
+        self,
+        method: str,
+        path: str,
+        json_body: Optional[dict] = None,
+        params: Optional[dict] = None,
+    ) -> dict:
+        """Reads and mutations get different retry policies.
+
+        A signed GET is idempotent, so transport blips, 429s and 5xx are all
+        retried. A POST/DELETE is not: a timeout or 5xx may mean the exchange
+        already applied the order and only the answer was lost, so retrying is
+        a duplicate-submission risk. Those surface as AmbiguousSubmissionError
+        for the caller to resolve by client_order_id. client_order_id
+        idempotency may well absorb a duplicate entry, but it is unverified
+        here and cancel_order carries no such key at all, so it is not
+        something to lean on.
+        """
+        if method == "GET":
+            return await self._signed_request_retrying(method, path, json_body, params)
+        try:
+            return await self._signed_request_once(method, path, json_body, params)
+        except httpx.TransportError as exc:
+            raise AmbiguousSubmissionError(
+                f"transport failure on {method} {path}: {exc} — the exchange may or may not "
+                "have applied this request; resolve by client_order_id",
+                client_order_ids=_client_order_ids_in(json_body),
+            ) from exc
 
     @_transient_retry
-    async def _signed_request(self, method: str, path: str, json_body: Optional[dict] = None) -> dict:
+    async def _signed_request_retrying(
+        self,
+        method: str,
+        path: str,
+        json_body: Optional[dict] = None,
+        params: Optional[dict] = None,
+    ) -> dict:
+        return await self._signed_request_once(method, path, json_body, params)
+
+    async def _signed_request_once(
+        self,
+        method: str,
+        path: str,
+        json_body: Optional[dict] = None,
+        params: Optional[dict] = None,
+    ) -> dict:
         private_key = self.load_private_key()
         timestamp_ms = str(int(datetime.now(timezone.utc).timestamp() * 1000))
         full_path = f"{self._base_path}{path}"
@@ -211,16 +327,32 @@ class KalshiClient:
             "KALSHI-ACCESS-SIGNATURE": signature,
             "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
         }
-        resp = await self._client().request(method, path, json=json_body, headers=headers)
+        resp = await self._client().request(method, path, json=json_body, params=params, headers=headers)
         if resp.status_code == 401:
             raise AuthError(f"Kalshi rejected signed {method} {path}: {resp.status_code} {resp.text}")
         if resp.status_code == 429:
             raise RateLimitError(f"Kalshi rate limit hit on {method} {path}")
+        if resp.status_code >= 500:
+            # Retryable only for reads. A 5xx on a POST/DELETE may mean the
+            # exchange already applied the mutation and merely lost the
+            # response, so it surfaces as a plain (non-retried) ExchangeError
+            # and the caller's own reconciliation decides what actually
+            # happened — see ServerError's docstring.
+            if method == "GET":
+                raise ServerError(f"Kalshi server error on GET {path}: {resp.status_code}")
+            raise AmbiguousSubmissionError(
+                f"Kalshi server error on {method} {path}: {resp.status_code} — not retried; "
+                "the request may or may not have been applied",
+                client_order_ids=_client_order_ids_in(json_body),
+            )
         if resp.status_code >= 400:
             raise OrderRejectedError(f"Kalshi rejected {method} {path}: {resp.status_code} {resp.text}")
         if resp.status_code == 204 or not resp.content:
             return {}
-        return resp.json()
+        try:
+            return resp.json()
+        except ValueError as exc:
+            raise ExchangeError(f"Kalshi returned a non-JSON body for {method} {path}") from exc
 
     def load_private_key(self) -> rsa.RSAPrivateKey:
         """Loads and caches the RSA private key used to sign both the WS
@@ -306,6 +438,11 @@ class KalshiClient:
         if cursor:
             params["cursor"] = cursor
         return await self._get("/markets", params=params)
+
+    async def get_market(self, market_id: str) -> dict:
+        """GET one market; used by recovery to distinguish settlement from drift."""
+        raw = await self._get(f"/markets/{market_id}")
+        return raw.get("market", raw)
 
     async def get_orderbook(self, market_id: str, side: Side = Side.YES, depth: int = 25) -> Orderbook:
         """GET /markets/{ticker}/orderbook — see module docstring for the
@@ -396,34 +533,56 @@ class KalshiClient:
         kalshi_side = "bid" if buying_yes else "ask"
         price = order.limit_price if order.side == Side.YES else (Decimal(1) - order.limit_price)
 
+        if order.size <= 0 or order.size != order.size.to_integral_value():
+            raise ExchangeError("order size must be a positive whole number of contracts")
+        if price <= 0 or price >= 1:
+            raise ExchangeError("order price must be strictly between 0 and 1")
+        if order.tick_size <= 0 or price % order.tick_size != 0:
+            raise ExchangeError(f"order price {price} is not aligned to tick size {order.tick_size}")
+        if order.time_in_force != TimeInForce.GOOD_TILL_CANCELED and order.expiration_ts is not None:
+            raise ExchangeError("expiration_time is only valid with good_till_canceled")
+
         body: dict[str, Any] = {
             "ticker": order.market_id,
             "client_order_id": client_order_id,
             "side": kalshi_side,
             "count": str(int(order.size)),
-            "price": f"{price:.2f}",
-            "time_in_force": "good_till_canceled",
+            "price": format(price, "f"),
+            "time_in_force": order.time_in_force.value,
             "self_trade_prevention_type": "taker_at_cross",
+            "cancel_order_on_pause": True,
         }
         if order.expiration_ts is not None:
-            body["expiration_ts"] = order.expiration_ts
+            body["expiration_time"] = order.expiration_ts
         return body
 
     @staticmethod
-    def _parse_order_response(raw: dict, order: OrderRequest, client_order_id: str) -> OrderResult:
+    def _derive_order_status(filled: Decimal, remaining: Decimal) -> OrderStatus:
+        """Shared status derivation for place_order/place_orders_batch's
+        response and get_order's polled response — both only give raw
+        fill/remaining counts, not a status label Kalshi computes for us.
+        filled<=0 alone isn't enough to mean "still resting" (OPEN): a
+        canceled-with-zero-fill order also has filled<=0, but remaining is
+        also 0 — that combination is CANCELED, not OPEN. Conflating the two
+        (as an earlier version of this did) mislabels a genuinely closed
+        order as still-live in the logs and dashboard."""
+        if filled <= 0:
+            return OrderStatus.CANCELED if remaining <= 0 else OrderStatus.OPEN
+        if remaining > 0:
+            return OrderStatus.PARTIALLY_FILLED
+        return OrderStatus.FILLED
+
+    @classmethod
+    def _parse_order_response(cls, raw: dict, order: OrderRequest, client_order_id: str) -> OrderResult:
         """Shared response parsing for a single order's result, whether it
         came back from place_order's own response body or as one entry of
         place_orders_batch's per-order list — both carry the same
         fill_count/remaining_count/order_id/client_order_id fields."""
         filled = Decimal(str(raw.get("fill_count", 0) or 0))
         remaining = Decimal(str(raw.get("remaining_count", order.size) or order.size))
-        if filled <= 0:
-            status = OrderStatus.OPEN
-        elif remaining > 0:
-            status = OrderStatus.PARTIALLY_FILLED
-        else:
-            status = OrderStatus.FILLED
+        status = cls._derive_order_status(filled, remaining)
         avg_price_raw = raw.get("average_fill_price")
+        avg_fee_raw = raw.get("average_fee_paid")
 
         return OrderResult(
             order_id=str(raw.get("order_id", "")),
@@ -432,6 +591,7 @@ class KalshiClient:
             filled_size=filled,
             remaining_size=remaining,
             average_fill_price=Decimal(str(avg_price_raw)) if avg_price_raw is not None else None,
+            average_fee_paid=Decimal(str(avg_fee_raw)) if avg_fee_raw is not None else None,
             raw=raw,
         )
 
@@ -444,17 +604,11 @@ class KalshiClient:
         exchange-level reject like insufficient_balance — caller decides
         whether that should stop the rest of a multi-leg basket.
 
-        order.expiration_ts (unix seconds), when set, is passed through as
-        Kalshi's documented order-expiration field: any portion unfilled by
-        that instant is auto-canceled instead of resting on the book. This
-        project's IOC substitute (Kalshi's v2 API has no distinct
-        immediate_or_cancel time_in_force) — execution/executor.py's
-        no-slippage fill sets this a couple seconds out from "now" so a
-        basket leg either matches immediately against the depth it was
-        priced against, or cancels, rather than resting and filling later
-        at a stale price. CONFIRMED LIVE 2026-08-26 against the demo
-        account, including real fills (see execution/executor.py's module
-        docstring for what that surfaced).
+        `time_in_force` supports native IOC/FOK/GTC. `expiration_ts`, when
+        supplied for a GTC order, is serialized using V2's documented
+        `expiration_time` field. IOC/FOK cannot be combined with an
+        expiration. Prices retain fixed-point precision and must align to
+        the request's market tick size.
         """
         if order.order_type != OrderType.LIMIT:
             raise ExchangeError("KalshiClient.place_order: only LIMIT orders are implemented")
@@ -511,6 +665,7 @@ class KalshiClient:
                 results.append(OrderResult(
                     order_id="", client_order_id=coid, status=OrderStatus.REJECTED,
                     filled_size=Decimal(0), remaining_size=order.size, average_fill_price=None,
+                    average_fee_paid=None,
                     raw={"error": {"code": "missing_response_entry"}},
                 ))
                 continue
@@ -518,6 +673,7 @@ class KalshiClient:
                 results.append(OrderResult(
                     order_id="", client_order_id=coid, status=OrderStatus.REJECTED,
                     filled_size=Decimal(0), remaining_size=order.size, average_fill_price=None,
+                    average_fee_paid=None,
                     raw=entry,
                 ))
                 continue
@@ -551,23 +707,106 @@ class KalshiClient:
         normalizes both into the same OrderResult shape."""
         raw = await self._signed_request("GET", f"/portfolio/orders/{order_id}")
         order = raw.get("order", {})
-        filled = Decimal(str(order.get("fill_count_fp", 0) or 0))
-        remaining = Decimal(str(order.get("remaining_count_fp", 0) or 0))
-        if filled <= 0:
-            status = OrderStatus.OPEN
-        elif remaining > 0:
-            status = OrderStatus.PARTIALLY_FILLED
-        else:
-            status = OrderStatus.FILLED
+        return self._parse_portfolio_order(order, order_id)
+
+    @classmethod
+    def _parse_portfolio_order(cls, order: dict, fallback_order_id: str = "") -> OrderResult:
+        """Normalize Get Order/Get Orders' portfolio-order representation."""
+        filled = Decimal(str(order.get("fill_count_fp", order.get("fill_count", 0)) or 0))
+        remaining = Decimal(str(order.get("remaining_count_fp", order.get("remaining_count", 0)) or 0))
+        status = cls._derive_order_status(filled, remaining)
+        avg_price_raw = order.get("average_fill_price")
+        avg_fee_raw = order.get("average_fee_paid")
+        if filled > 0 and avg_price_raw is None:
+            fill_cost = Decimal(str(order.get("taker_fill_cost_dollars", 0) or 0)) + Decimal(
+                str(order.get("maker_fill_cost_dollars", 0) or 0)
+            )
+            if fill_cost:
+                avg_price_raw = fill_cost / filled
+        if filled > 0 and avg_fee_raw is None:
+            fees = Decimal(str(order.get("taker_fees_dollars", 0) or 0)) + Decimal(
+                str(order.get("maker_fees_dollars", 0) or 0)
+            )
+            avg_fee_raw = fees / filled
         return OrderResult(
-            order_id=str(order.get("order_id", order_id)),
+            order_id=str(order.get("order_id", fallback_order_id)),
             client_order_id=order.get("client_order_id"),
             status=status,
             filled_size=filled,
             remaining_size=remaining,
-            average_fill_price=None,   # not present on this endpoint's response — only needed here for fill/remaining size, not price
+            average_fill_price=Decimal(str(avg_price_raw)) if avg_price_raw is not None else None,
+            average_fee_paid=Decimal(str(avg_fee_raw)) if avg_fee_raw is not None else None,
             raw=order,
         )
+
+    async def get_orders(
+        self,
+        status: Optional[str] = None,
+        client_order_id_prefix: Optional[str] = None,
+    ) -> list[OrderResult]:
+        """Return all current orders, paginating and optionally filtering ownership.
+
+        Kalshi supports server-side status filtering but not a client-order-id
+        prefix, so the latter is deliberately applied locally after all pages
+        have been retrieved.
+        """
+        results: list[OrderResult] = []
+        cursor: Optional[str] = None
+        while True:
+            params: dict[str, Any] = {"limit": 1000}
+            if status is not None:
+                params["status"] = status
+            if cursor:
+                params["cursor"] = cursor
+            raw = await self._signed_request("GET", "/portfolio/orders", params=params)
+            for order in raw.get("orders", []):
+                client_id = str(order.get("client_order_id", ""))
+                if client_order_id_prefix is None or client_id.startswith(client_order_id_prefix):
+                    results.append(self._parse_portfolio_order(order))
+            cursor = raw.get("cursor") or None
+            if not cursor:
+                return results
+
+    async def resolve_client_order_ids(self, client_order_ids: list[str]) -> dict[str, OrderResult]:
+        """Look up what the exchange actually holds for specific submitted ids.
+
+        This is how an AmbiguousSubmissionError gets settled: after a lost
+        response, the client_order_id is the only handle we have on an order
+        whose exchange-assigned order_id we never received. Returns only the
+        ids Kalshi knows about — an id absent from the result was genuinely
+        never accepted, which is the only case where treating it as "nothing
+        happened" is safe.
+
+        Reads every status, not just resting orders: an order that filled and
+        closed between submission and this lookup must still be found, or the
+        caller would wrongly conclude nothing happened.
+        """
+        wanted = set(client_order_ids)
+        if not wanted:
+            return {}
+        found: dict[str, OrderResult] = {}
+        for order in await self.get_orders():
+            coid = order.client_order_id
+            if coid in wanted:
+                found[coid] = order
+        return found
+
+    async def cancel_orders(self, order_ids: list[str]) -> dict[str, Optional[str]]:
+        """Best-effort cancel exact known IDs; returns ID -> error or None.
+
+        Exact IDs keep emergency cancellation strategy-scoped. The sequential
+        V2 endpoint is used intentionally so one malformed/already-terminal ID
+        cannot reject cancellation of every other order in a batch.
+        """
+        outcomes: dict[str, Optional[str]] = {}
+        for order_id in dict.fromkeys(order_ids):
+            try:
+                await self.cancel_order(order_id)
+            except ExchangeError as exc:
+                outcomes[order_id] = str(exc)
+            else:
+                outcomes[order_id] = None
+        return outcomes
 
     async def get_positions(self) -> dict[str, Decimal]:
         """GET /portfolio/positions — signed. VERIFIED LIVE 2026-08-26.
@@ -579,8 +818,15 @@ class KalshiClient:
         records actually show, catching any drift (a delayed unwind fill,
         a cancel that raced a fill, anything else) that fill-response
         bookkeeping alone wouldn't."""
-        raw = await self._signed_request("GET", "/portfolio/positions")
-        return {
-            p["ticker"]: Decimal(str(p.get("position_fp", 0)))
-            for p in raw.get("market_positions", [])
-        }
+        positions: dict[str, Decimal] = {}
+        cursor: str | None = None
+        while True:
+            params: dict[str, Any] = {"limit": 1000, "count_filter": "position"}
+            if cursor:
+                params["cursor"] = cursor
+            raw = await self._signed_request("GET", "/portfolio/positions", params=params)
+            for position in raw.get("market_positions", []):
+                positions[position["ticker"]] = Decimal(str(position.get("position_fp", 0)))
+            cursor = raw.get("cursor") or None
+            if not cursor:
+                return positions

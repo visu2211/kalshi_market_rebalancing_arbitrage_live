@@ -38,6 +38,13 @@ class ExecutionCandidate:
 
 
 def hours_to_settlement(now: datetime, expected_settlement_time: datetime) -> Decimal:
+    """Hours until capital committed to this event frees up.
+
+    CAUTION: the _MIN_HOURS floor also swallows NEGATIVE deltas, so an event
+    already past its settlement returns the floor and reads as maximally fast.
+    That is meaningless for an overdue market — see _rank_key, which is why
+    ranking must not consult this number alone.
+    """
     delta_hours = Decimal(str((expected_settlement_time - now).total_seconds() / 3600))
     return max(delta_hours, _MIN_HOURS)
 
@@ -53,24 +60,50 @@ def hourly_return_rate(opportunity: BasketOpportunity, hours: Decimal) -> Decima
     return (opportunity.edge_usd / opportunity.basket_price_usd) / hours
 
 
+def is_settlement_overdue(candidate: ExecutionCandidate, now: datetime) -> bool:
+    """True once an event is past its own expected settlement but still open.
+
+    Kalshi keeps these tradeable while settlement is pending, so they reach the
+    ranker like any other candidate.
+    """
+    return candidate.expected_settlement_time <= now
+
+
+def _rank_key(candidate: ExecutionCandidate, now: datetime) -> tuple[int, Decimal]:
+    """Sort key: live candidates first, then by capital velocity within each tier.
+
+    The tier exists because hourly_return_rate cannot be trusted for an overdue
+    event. hours_to_settlement floors a NEGATIVE remaining time at _MIN_HOURS,
+    so an event that expired hours ago reads as "capital frees in 36 seconds" —
+    the best score obtainable — when the truth is the reverse: settlement lag on
+    an overdue market is unknown and empirically long (observed live: expired
+    20h earlier and still pending), making it the slowest way to tie up capital,
+    not the fastest. Unranked, a 5c overdue basket outranked an 8c live one by
+    130x, and under max_baskets_per_day=1 that ordering IS the decision.
+
+    Overdue candidates stay eligible — a complete basket still pays $1 whenever
+    settlement lands, so this is deliberately a demotion, not a ban. They simply
+    stop pre-empting live candidates on a scoring artifact.
+    """
+    rate = hourly_return_rate(candidate.opportunity, hours_to_settlement(now, candidate.expected_settlement_time))
+    return (0 if is_settlement_overdue(candidate, now) else 1, rate)
+
+
 def select_executable(
     candidates: list[ExecutionCandidate],
     available_capital: Decimal,
     now: datetime,
 ) -> list[ExecutionCandidate]:
-    """Ranks `candidates` by hourly_return_rate (highest first) and
-    greedily selects as many as fit within available_capital. A candidate
+    """Ranks `candidates` by _rank_key (live before overdue, then by capital
+    velocity within each tier) and greedily selects as many as fit within
+    available_capital. A candidate
     that doesn't fit is skipped rather than sized down (every selected
     basket still fills at its full priced max_size), and a cheaper,
     lower-ranked candidate after it that DOES fit is still taken —
     knapsack-greedy, not exact-optimal, but a reasonable approximation for
     the small number of concurrently-open opportunities this realistically
     ever sees at once."""
-    ranked = sorted(
-        candidates,
-        key=lambda c: hourly_return_rate(c.opportunity, hours_to_settlement(now, c.expected_settlement_time)),
-        reverse=True,
-    )
+    ranked = sorted(candidates, key=lambda c: _rank_key(c, now), reverse=True)
     selected: list[ExecutionCandidate] = []
     remaining = available_capital
     for candidate in ranked:

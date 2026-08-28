@@ -32,8 +32,16 @@ def _market(
     return market
 
 
-def _event(event_ticker, mutually_exclusive, markets, title="Some event"):
-    return {"event_ticker": event_ticker, "title": title, "mutually_exclusive": mutually_exclusive, "markets": markets}
+def _event(event_ticker, mutually_exclusive, markets, title="Some event", **overrides):
+    event = {
+        "event_ticker": event_ticker,
+        "title": title,
+        "mutually_exclusive": mutually_exclusive,
+        "collateral_return_type": "MECNET",
+        "markets": markets,
+    }
+    event.update(overrides)
+    return event
 
 
 def test_keeps_mutually_exclusive_event_settling_later_today():
@@ -61,7 +69,7 @@ def test_drops_event_above_max_legs():
     assert filter_events(events, 2, 6, now=NOW) == []
 
 
-def test_finalized_legs_excluded_from_count_and_output():
+def test_partially_finalized_event_is_rejected_as_non_exhaustive():
     events = [_event("KXPARTIAL-1", True, [
         _market("A", status="active"),
         _market("B", status="active"),
@@ -69,8 +77,36 @@ def test_finalized_legs_excluded_from_count_and_output():
     ])]
     candidates = filter_events(events, min_outcome_legs=2, max_outcome_legs=6, now=NOW)
 
-    assert len(candidates) == 1
-    assert candidates[0].leg_tickers == ["A", "B"]
+    assert candidates == []
+
+
+def test_drops_mutually_exclusive_event_without_explicit_net_collateral():
+    events = [_event("KXATMostONE-1", True, [_market("A"), _market("B")], collateral_return_type="")]
+    assert filter_events(events, 2, 6, now=NOW) == []
+
+
+def test_drops_unsupported_fee_override():
+    events = [_event("KXFLAT-1", True, [_market("A"), _market("B")], fee_type_override="flat")]
+    assert filter_events(events, 2, 6, now=NOW) == []
+
+
+def test_carries_quadratic_fee_multiplier():
+    events = [_event(
+        "KXHIGHFEE-1",
+        True,
+        [_market("A"), _market("B")],
+        fee_type_override="quadratic",
+        fee_multiplier_override="1.5",
+    )]
+    candidates = filter_events(events, 2, 6, now=NOW)
+    assert candidates[0].fee_multiplier == Decimal("1.5")
+
+
+def test_drops_provisional_or_non_dollar_market():
+    provisional = _market("A") | {"is_provisional": True}
+    assert filter_events([_event("KXPROV", True, [provisional, _market("B")])], 2, 6, now=NOW) == []
+    non_dollar = _market("A") | {"notional_value_dollars": "2.0000"}
+    assert filter_events([_event("KXNOTIONAL", True, [non_dollar, _market("B")])], 2, 6, now=NOW) == []
 
 
 def test_drops_event_settling_tomorrow():
@@ -205,3 +241,39 @@ def test_select_by_volume_ties_broken_deterministically_by_ticker():
     b = _candidate("ALPHA", {"A": 50})
     selected = select_by_volume([a, b], max_legs=10)
     assert [c.event_ticker for c in selected] == ["ALPHA", "ZEBRA"]
+
+
+def test_event_rejected_when_any_leg_lacks_a_settlement_timestamp():
+    """Accepting an event because *some* leg parsed meant the same-day horizon
+    was decided from a subset — a leg settling next week could ride along
+    inside an approved basket."""
+    today = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+    event = {
+        "event_ticker": "KXPARTIAL",
+        "mutually_exclusive": True,
+        "collateral_return_type": "MECNET",
+        "markets": [
+            {"ticker": "A", "status": "active", "notional_value_dollars": "1",
+             "volume_24h_fp": "100", "expected_expiration_time": "2026-08-28T20:00:00Z"},
+            {"ticker": "B", "status": "active", "notional_value_dollars": "1",
+             "volume_24h_fp": "100"},   # no timestamp at all
+        ],
+    }
+    assert filter_events([event], 2, 6, now=today) == []
+
+
+def test_event_accepted_when_every_leg_has_a_settlement_timestamp():
+    today = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+    event = {
+        "event_ticker": "KXWHOLE",
+        "mutually_exclusive": True,
+        "collateral_return_type": "MECNET",
+        "markets": [
+            {"ticker": "A", "status": "active", "notional_value_dollars": "1",
+             "volume_24h_fp": "100", "expected_expiration_time": "2026-08-28T20:00:00Z"},
+            {"ticker": "B", "status": "active", "notional_value_dollars": "1",
+             "volume_24h_fp": "100", "expected_expiration_time": "2026-08-28T21:00:00Z"},
+        ],
+    }
+    result = filter_events([event], 2, 6, now=today)
+    assert len(result) == 1 and result[0].event_ticker == "KXWHOLE"

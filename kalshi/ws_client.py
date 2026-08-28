@@ -1,8 +1,14 @@
 """Kalshi WebSocket client — subscribes to the orderbook_delta channel for
 a set of tickers and yields every message.
 
-CONFIRMED LIVE 2026-08-25: connecting to wss://api.elections.kalshi.com/
-trade-api/ws/v2 with no auth headers gets an immediate HTTP 401 — Kalshi's
+NOTE ON HOSTS: the verification notes below were taken against
+wss://api.elections.kalshi.com/trade-api/ws/v2. config/settings.yaml now
+points at wss://external-api-ws.kalshi.com/trade-api/ws/v2; the signed
+handshake, message schema and sequence semantics were re-confirmed live
+against that host on 2026-08-27 (29,964 seq-bearing messages, zero gaps).
+
+CONFIRMED LIVE 2026-08-25: connecting with no auth headers gets an
+immediate HTTP 401 — Kalshi's
 WS upgrade requires the same signed KALSHI-ACCESS-KEY/SIGNATURE/TIMESTAMP
 headers as authenticated REST even for market-data-only channels, exactly
 as arb-bot's exchanges/kalshi_client.py docstring claimed.
@@ -40,6 +46,11 @@ logger = structlog.get_logger(__name__)
 _INITIAL_BACKOFF_S = 1.0
 _MAX_BACKOFF_S = 30.0
 
+# Synthetic message (not from Kalshi) emitted by stream() immediately after
+# every subscribe, including the first. Consumers maintaining incremental
+# book state must treat it as "discard everything you have" — see stream().
+WS_RECONNECTED_MESSAGE_TYPE = "ws_reconnected"
+
 
 class KalshiWSClient:
     def __init__(self, ws_url: str, client: KalshiClient) -> None:
@@ -69,16 +80,40 @@ class KalshiWSClient:
             try:
                 async with websockets.connect(self._ws_url, additional_headers=self._auth_headers()) as ws:
                     backoff = _INITIAL_BACKOFF_S
+                    last_seq: int | None = None
                     await ws.send(json.dumps({
                         "id": 1,
                         "cmd": "subscribe",
                         "params": {"channels": list(channels), "market_tickers": market_tickers},
                     }))
+                    # Everything a consumer built from the previous connection
+                    # is now unusable: this subscription replays a fresh
+                    # snapshot per ticker, and any delta arriving before its
+                    # ticker's snapshot lands describes a book we no longer
+                    # hold. Consumers that keep incremental state MUST discard
+                    # it here — see stream/monitor.py's LocalBook.invalidate
+                    # and WS_RECONNECTED_MESSAGE_TYPE.
+                    yield {"type": WS_RECONNECTED_MESSAGE_TYPE}
                     async for raw in ws:
                         try:
-                            yield json.loads(raw)
+                            message = json.loads(raw)
                         except json.JSONDecodeError:
                             logger.warning("ws_message_not_json", raw=raw[:200])
+                            continue
+
+                        # orderbook_snapshot/orderbook_delta messages carry a
+                        # subscription-wide monotonically increasing sequence.
+                        # Applying deltas after a gap corrupts the local book,
+                        # so close this connection and resubscribe for fresh
+                        # snapshots instead of continuing with unknown state.
+                        seq = message.get("seq")
+                        if isinstance(seq, int):
+                            if last_seq is not None and seq != last_seq + 1:
+                                logger.error("ws_sequence_gap", expected=last_seq + 1, received=seq)
+                                await ws.close()
+                                break
+                            last_seq = seq
+                        yield message
             except (websockets.exceptions.WebSocketException, OSError) as exc:
                 logger.warning("ws_disconnected", error=str(exc), retry_in_s=backoff)
                 await asyncio.sleep(backoff)

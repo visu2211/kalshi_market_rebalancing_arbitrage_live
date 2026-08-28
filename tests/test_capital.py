@@ -8,6 +8,7 @@ from execution.capital import (
     estimated_capital_required,
     hourly_return_rate,
     hours_to_settlement,
+    is_settlement_overdue,
     select_executable,
 )
 from scanner.basket import BasketOpportunity
@@ -94,3 +95,45 @@ def test_select_executable_spends_within_budget_not_over():
     selected = select_executable([a, b], available_capital=Decimal("15"), now=NOW)
     # only A fits alone in the 15 budget (10 spent, 5 left isn't enough for B's 10)
     assert [c.event_ticker for c in selected] == ["A"]
+
+
+# --- overdue-settlement demotion (added 2026-08-28) --------------------------
+# hours_to_settlement floors a NEGATIVE remaining time at _MIN_HOURS, so an
+# event that expired hours ago scored as the fastest possible capital turnover.
+# Under max_baskets_per_day=1 that ordering is the whole decision.
+
+
+def test_overdue_event_no_longer_outranks_a_better_live_edge():
+    """Both shapes were really detected 2026-08-28 minutes apart: the overdue
+    basket had a 5c edge, the live one 8c, and the overdue one won by 130x."""
+    overdue = _candidate("OVERDUE", 0.95, 0.05, 1, hours_out=-20)
+    live = _candidate("LIVE", 0.92, 0.08, 1, hours_out=2.4)
+    order = [c.event_ticker for c in select_executable([overdue, live], Decimal(100), NOW)]
+    assert order == ["LIVE", "OVERDUE"]
+
+
+def test_overdue_events_are_demoted_not_excluded():
+    """A complete basket still pays $1 whenever settlement lands, so an overdue
+    candidate stays eligible when it is the only one on offer."""
+    overdue = _candidate("OVERDUE", 0.95, 0.05, 1, hours_out=-20)
+    assert [c.event_ticker for c in select_executable([overdue], Decimal(100), NOW)] == ["OVERDUE"]
+
+
+def test_overdue_candidates_still_rank_against_each_other_by_return():
+    weak = _candidate("WEAK", 0.97, 0.03, 1, hours_out=-20)
+    strong = _candidate("STRONG", 0.90, 0.10, 1, hours_out=-5)
+    order = [c.event_ticker for c in select_executable([weak, strong], Decimal(100), NOW)]
+    assert order == ["STRONG", "WEAK"]
+
+
+def test_live_candidates_still_rank_by_capital_velocity():
+    """Original behaviour must survive: at equal edge, sooner settlement wins."""
+    slow = _candidate("SLOW", 0.95, 0.05, 1, hours_out=8)
+    fast = _candidate("FAST", 0.95, 0.05, 1, hours_out=1)
+    order = [c.event_ticker for c in select_executable([slow, fast], Decimal(100), NOW)]
+    assert order == ["FAST", "SLOW"]
+
+
+def test_settlement_exactly_now_counts_as_overdue():
+    assert is_settlement_overdue(_candidate("X", 0.95, 0.05, 1, hours_out=0), NOW) is True
+    assert is_settlement_overdue(_candidate("Y", 0.95, 0.05, 1, hours_out=0.001), NOW) is False

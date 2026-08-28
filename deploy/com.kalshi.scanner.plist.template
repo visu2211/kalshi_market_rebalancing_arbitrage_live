@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS launchd agent for the detection loop. The sibling
+  kalshi-scanner.service.template is the Linux/systemd equivalent.
+
+  Like that unit, ProgramArguments carries no live-trading confirmation flag,
+  so this agent is detection-only by construction: scripts/run_scanner.py
+  refuses to start when execution.target is prod unless that flag is passed.
+  Arming production is a deliberate foreground action, never something a
+  supervisor does on its own.
+
+  Install:
+    sed -e "s|__DEPLOY_DIR__|$PWD|g" deploy/com.kalshi.scanner.plist.template \
+      > ~/Library/LaunchAgents/com.kalshi.scanner.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.kalshi.scanner.plist
+
+  Status / stop:
+    launchctl print gui/$(id -u)/com.kalshi.scanner | head -20
+    launchctl bootout gui/$(id -u)/com.kalshi.scanner
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.kalshi.scanner</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__DEPLOY_DIR__/.venv/bin/python</string>
+        <string>scripts/run_scanner.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__DEPLOY_DIR__</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart only on abnormal exit, and never faster than every 30s, so a
+         hard config error surfaces as a stopped agent rather than a hot crash
+         loop. Note that RiskState.session_basket_attempts is intentionally
+         process-scoped and NOT persisted, so any restart resets the
+         per-session basket cap; only the durable max_baskets_per_day survives.
+         That is the limit to rely on under a supervisor. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>__DEPLOY_DIR__/data/scanner.log</string>
+    <key>StandardErrorPath</key>
+    <string>__DEPLOY_DIR__/data/scanner.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
