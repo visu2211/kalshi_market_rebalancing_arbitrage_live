@@ -77,12 +77,13 @@ from execution.executor import (
     estimate_worst_case_unwind_loss,
 )
 from execution.risk import RiskState, RiskStateError
-from kalshi.client import ExchangeError, KalshiClient, OrderStatus, Side
+from execution.store import OrderStore
+from kalshi.client import ExchangeError, KalshiClient, OrderbookLevel, OrderStatus, Side
 from kalshi.ws_client import WS_RECONNECTED_MESSAGE_TYPE, KalshiWSClient
 from scanner.basket import BasketOpportunity, LegQuote, compute_opportunity, incoherent_legs
 from scanner.fees import taker_fee
-from scanner.fees import taker_fee
 from scanner.filters import EventCandidate, filter_events, has_recent_activity, select_by_volume
+from scanner.relationships import Relationship, build_relationships
 
 logger = structlog.get_logger(__name__)
 
@@ -182,6 +183,29 @@ class LocalBook:
             best_bid_price,                     # best_bid
             self.yes_bids[best_bid_price],      # bid_size
         )
+
+    def yes_ask_levels(self, depth: int) -> list[OrderbookLevel]:
+        """Walks the YES ask ladder — synthesized from no_bids exactly as
+        best_yes_quote synthesizes the top level, 1 - price per level —
+        ascending price (best/cheapest ask first), up to `depth` levels.
+        The full ladder is already held in no_bids (apply_snapshot/apply_delta
+        keep every level, not just the top); this is a read-path addition,
+        not a storage change — see scanner.basket.compute_opportunity_depth_aware,
+        which consumes this to price more than the best level."""
+        return sorted(
+            (OrderbookLevel(price=Decimal(1) - price, size=size) for price, size in self.no_bids.items()),
+            key=lambda level: level.price,
+        )[:depth]
+
+    def yes_bid_levels(self, depth: int) -> list[OrderbookLevel]:
+        """Walks the YES bid ladder (yes_bids, sent directly by Kalshi, no
+        synthesis needed) descending price (best/highest bid first), up to
+        `depth` levels."""
+        return sorted(
+            (OrderbookLevel(price=price, size=size) for price, size in self.yes_bids.items()),
+            key=lambda level: level.price,
+            reverse=True,
+        )[:depth]
 
 
 def handle_message(msg: dict, books: dict[str, LocalBook]) -> Optional[str]:
@@ -463,7 +487,10 @@ def _log_entry_leg_outcomes(opportunity: BasketOpportunity, leg_results: list[Le
         )
 
 
-async def _execute_and_log(opportunity: BasketOpportunity, execution_client: KalshiClient, settings: Settings) -> Optional[AtomicExecutionResult]:
+async def _execute_and_log(
+    opportunity: BasketOpportunity, execution_client: KalshiClient, settings: Settings,
+    store: Optional[OrderStore] = None,
+) -> Optional[AtomicExecutionResult]:
     """Fires execution/executor.py's batched basket placement against
     whichever account settings.execution.target configures (demo or —
     REAL MONEY — prod) and logs every leg's outcome (and, if the legs
@@ -473,7 +500,9 @@ async def _execute_and_log(opportunity: BasketOpportunity, execution_client: Kal
     execution was skipped for missing credentials) so the caller can
     update believed positions and feed .mismatched / .unwind_confirmed to
     the circuit breaker — see execution/executor.py's module docstring
-    for why both matter, not just whether it mismatched."""
+    for why both matter, not just whether it mismatched. store, if given,
+    is threaded straight to execute_opportunity — see that function's and
+    execution/store.py's docstrings."""
     if not execution_client.has_signing_credentials:
         logger.warning(
             "execution_skipped_no_demo_credentials",
@@ -483,7 +512,9 @@ async def _execute_and_log(opportunity: BasketOpportunity, execution_client: Kal
         return None
 
     try:
-        result = await execute_opportunity(execution_client, opportunity)
+        result = await execute_opportunity(
+            execution_client, opportunity, allow_no_direction=settings.execution.allow_no_direction, store=store,
+        )
     except UnresolvedSubmissionError as exc:
         # The true position at the exchange is unknown. Do not submit another
         # stage, do not classify the basket. Cancel what we can identify,
@@ -895,7 +926,7 @@ async def _confirm_opportunity_via_rest(
 async def _reconcile_execution(
     open_opportunities: dict[str, BasketOpportunity],
     executed_opportunities: set[str],
-    event_by_ticker: dict[str, EventCandidate],
+    relationship_by_event_ticker: dict[str, Relationship],
     execution_client: KalshiClient,
     market_data_client: KalshiClient,
     settings: Settings,
@@ -903,6 +934,7 @@ async def _reconcile_execution(
     circuit_breaker: _CircuitBreaker,
     believed_positions: dict[str, Decimal],
     risk_state: RiskState,
+    store: Optional[OrderStore] = None,
 ) -> None:
     """Capital-aware execution pass — re-ranks every currently-open,
     not-yet-executed opportunity by execution.capital.hourly_return_rate
@@ -928,13 +960,14 @@ async def _reconcile_execution(
     candidates: list[ExecutionCandidate] = []
     for event_ticker in unexecuted:
         opportunity = _cap_opportunity_size(open_opportunities[event_ticker], settings.execution.max_order_size_contracts)
-        # BasketOpportunity.legs holds leg tickers; event_by_ticker is
-        # keyed by leg ticker, so any one leg resolves back to the event's
-        # EventCandidate (for its expected_settlement_time).
-        event_candidate = event_by_ticker.get(opportunity.legs[0])
-        if event_candidate is None:
+        # Looked up by the opportunity's own event_ticker, not by resolving
+        # its first leg back to an owner — a leg can belong to more than one
+        # relationship (see scanner/relationships.py), so deriving the event
+        # indirectly via legs[0] would be ambiguous; event_ticker is not.
+        relationship = relationship_by_event_ticker.get(event_ticker)
+        if relationship is None:
             continue
-        candidates.append(ExecutionCandidate(event_ticker, opportunity, event_candidate.expected_settlement_time))
+        candidates.append(ExecutionCandidate(event_ticker, opportunity, relationship.expected_settlement_time))
     if not candidates:
         return
 
@@ -1108,7 +1141,7 @@ async def _reconcile_execution(
         risk_state.persist(settings.execution.risk_state_path)
 
         try:
-            result = await _execute_and_log(opportunity, execution_client, settings)
+            result = await _execute_and_log(opportunity, execution_client, settings, store)
         except UnresolvedSubmissionError as exc:
             # Unknown exchange state is strictly worse than a known mismatch:
             # positions may exist that our bookkeeping cannot see. Trip durably
@@ -1179,7 +1212,8 @@ async def _reconcile_execution(
 async def _reprice_event(
     ticker: str,
     books: dict[str, LocalBook],
-    event_by_ticker: dict[str, EventCandidate],
+    relationships_by_ticker: dict[str, list[Relationship]],
+    relationship_by_event_ticker: dict[str, Relationship],
     settings: Settings,
     open_opportunities: dict[str, BasketOpportunity],
     executed_opportunities: set[str],
@@ -1190,15 +1224,45 @@ async def _reprice_event(
     believed_positions: dict[str, Decimal],
     risk_state: RiskState,
     detection_diagnostics: dict[str, Any],
+    store: Optional[OrderStore] = None,
 ) -> None:
-    """Re-runs the basket edge calc for the event that owns `ticker` and
-    logs an open/close transition if the opportunity state changed. A fresh
+    """Dispatches to every relationship that owns `ticker` — see
+    scanner/relationships.py: a ticker can belong to more than one
+    relationship (today, always exactly one, since only auto-detected
+    exhaustive-partition relationships exist, but the dispatch must not
+    assume that), so this re-prices each one rather than just the first."""
+    for relationship in relationships_by_ticker.get(ticker, []):
+        await _reprice_relationship(
+            relationship, books, relationship_by_event_ticker, settings, open_opportunities,
+            executed_opportunities, execution_client, market_data_client, balance_cache,
+            circuit_breaker, believed_positions, risk_state, detection_diagnostics, store,
+        )
+
+
+async def _reprice_relationship(
+    relationship: Relationship,
+    books: dict[str, LocalBook],
+    relationship_by_event_ticker: dict[str, Relationship],
+    settings: Settings,
+    open_opportunities: dict[str, BasketOpportunity],
+    executed_opportunities: set[str],
+    execution_client: Optional[KalshiClient],
+    market_data_client: KalshiClient,
+    balance_cache: _BalanceCache,
+    circuit_breaker: _CircuitBreaker,
+    believed_positions: dict[str, Decimal],
+    risk_state: RiskState,
+    detection_diagnostics: dict[str, Any],
+    store: Optional[OrderStore] = None,
+) -> None:
+    """Re-runs the basket edge calc for one relationship and logs an
+    open/close transition if the opportunity state changed. A fresh
     close->open transition also triggers a capital-aware execution pass
     (_reconcile_execution), if armed (settings.execution.enabled and
-    execution_client provided)."""
-    candidate = event_by_ticker.get(ticker)
-    if candidate is None:
-        return
+    execution_client provided). Formerly the single-candidate body of
+    _reprice_event, extracted so that function can dispatch to every
+    relationship a changed ticker belongs to."""
+    candidate = relationship
 
     legs: list[LegQuote] = []
     quote_now = time.monotonic()
@@ -1286,11 +1350,13 @@ async def _reprice_event(
                 max_size=str(opportunity.max_size),
             )
             _append_opportunity_jsonl(opportunity, settings.logging.opportunities_log_path)
+            if store is not None:
+                store.record_opportunity(opportunity)
         if settings.execution.enabled and execution_client is not None:
             await _reconcile_execution(
-                open_opportunities, executed_opportunities, event_by_ticker, execution_client,
+                open_opportunities, executed_opportunities, relationship_by_event_ticker, execution_client,
                 market_data_client, settings, balance_cache, circuit_breaker, believed_positions,
-                risk_state,
+                risk_state, store,
             )
     elif was_open:
         del open_opportunities[candidate.event_ticker]
@@ -1312,9 +1378,30 @@ async def _stream_shortlist(
     circuit_breaker: _CircuitBreaker,
     believed_positions: dict[str, Decimal],
     risk_state: RiskState,
+    store: Optional[OrderStore] = None,
 ) -> None:
-    books: dict[str, LocalBook] = {t: LocalBook() for c in shortlist for t in c.leg_tickers}
-    event_by_ticker: dict[str, EventCandidate] = {t: c for c in shortlist for t in c.leg_tickers}
+    relationships = build_relationships(
+        shortlist,
+        settings.relationships.verified_event_tickers,
+        trust_auto_detected=settings.relationships.trust_auto_detected,
+    )
+    if store is not None:
+        # One row per relationship per rescan cycle — a queryable history of
+        # what was auto-detected vs. manually verified over time, not just
+        # the current set. See execution/store.py's record_relationships.
+        store.record_relationships(relationships)
+    books: dict[str, LocalBook] = {t: LocalBook() for r in relationships for t in r.leg_tickers}
+    # Fan-out index: a leg ticker can belong to more than one relationship
+    # (not possible yet — only one auto-detected exhaustive-partition
+    # relationship exists per event today — but a strict 1:1 dict here
+    # would silently clobber the moment a second relationship type or
+    # direction is added, exactly the bug this replaces). event_ticker
+    # itself stays a unique relationship identity, so that index stays 1:1.
+    relationships_by_ticker: dict[str, list[Relationship]] = {}
+    for r in relationships:
+        for t in r.leg_tickers:
+            relationships_by_ticker.setdefault(t, []).append(r)
+    relationship_by_event_ticker: dict[str, Relationship] = {r.event_ticker: r for r in relationships}
     open_opportunities: dict[str, BasketOpportunity] = {}
     executed_opportunities: set[str] = set()
     balance_cache = _BalanceCache()
@@ -1348,9 +1435,10 @@ async def _stream_shortlist(
         ticker = handle_message(msg, books)
         if ticker is not None:
             await _reprice_event(
-                ticker, books, event_by_ticker, settings, open_opportunities, executed_opportunities,
-                execution_client, market_data_client, balance_cache, circuit_breaker, believed_positions,
-                risk_state, detection_diagnostics,
+                ticker, books, relationships_by_ticker, relationship_by_event_ticker, settings,
+                open_opportunities, executed_opportunities, execution_client, market_data_client,
+                balance_cache, circuit_breaker, believed_positions, risk_state, detection_diagnostics,
+                store,
             )
 
         now = time.monotonic()
@@ -1364,9 +1452,9 @@ async def _stream_shortlist(
                 # unexecuted candidate could otherwise go unreconsidered
                 # between its own ticks.
                 await _reconcile_execution(
-                    open_opportunities, executed_opportunities, event_by_ticker, execution_client,
+                    open_opportunities, executed_opportunities, relationship_by_event_ticker, execution_client,
                     market_data_client, settings, balance_cache, circuit_breaker, believed_positions,
-                    risk_state,
+                    risk_state, store,
                 )
 
                 if now - last_reconciled >= _POSITION_RECONCILE_INTERVAL_S:
@@ -1450,6 +1538,7 @@ async def run_stage3(
     ws_client: KalshiWSClient,
     settings: Settings,
     execution_client: Optional[KalshiClient] = None,
+    store: Optional[OrderStore] = None,
 ) -> None:
     """Runs forever: refreshes Stage 1 + the volume ranking every
     settings.scanner.rescan_interval_s and streams Stage 3 continuously
@@ -1458,7 +1547,10 @@ async def run_stage3(
     Stage-2-gated shortlist). execution_client, when provided (see
     scripts/run_scanner.py — only constructed when settings.execution.enabled),
     is where a freshly detected opportunity's basket gets placed — see
-    _execute_and_log."""
+    _execute_and_log. store, if given (execution/store.py's OrderStore), also
+    records every detected opportunity and every rescan cycle's relationship
+    set — additive alongside data/opportunities.jsonl, defaults to None
+    (no persistence), the exact behavior every existing caller exercises."""
     try:
         risk_state = RiskState.load(settings.execution.risk_state_path)
     except RiskStateError as exc:
@@ -1613,7 +1705,7 @@ async def run_stage3(
             await asyncio.wait_for(
                 _stream_shortlist(
                     ws_client, shortlist, settings, execution_client, client, status,
-                    circuit_breaker, believed_positions, risk_state,
+                    circuit_breaker, believed_positions, risk_state, store,
                 ),
                 timeout=settings.scanner.rescan_interval_s,
             )

@@ -3,9 +3,11 @@ place_orders_batch()/cancel_order()/get_order() call, so these tests
 verify order construction, batching, the unwind-on-mismatch safety logic,
 and unwind confirmation without hitting Kalshi.
 
-buy_basket only — sell_basket was removed 2026-08-26 (see
-execution/executor.py's and scanner/basket.py's docstrings), so every
-opportunity here is a BUY and every unwind is a SELL.
+Two directions: buy_basket (every opportunity a BUY of YES, every unwind a
+SELL of YES) and buy_all_no (every opportunity a BUY of NO, every unwind a
+SELL of NO — gated behind allow_no_direction, default False; see
+execution/executor.py's and scanner/basket.py's docstrings for why this
+reproduces the deleted sell_basket direction).
 
 _live variant: also verifies the no-slippage IOC-style expiration_ts is
 set on every leg, and — added 2026-08-26 after a real incident (see
@@ -20,9 +22,17 @@ from typing import Optional
 
 import pytest
 
-from execution.executor import STRATEGY_CLIENT_ORDER_ID_PREFIX, UnresolvedSubmissionError, compute_unwind_legs, estimate_worst_case_unwind_loss, execute_opportunity
+from execution.executor import (
+    STRATEGY_CLIENT_ORDER_ID_PREFIX,
+    NoDirectionNotAllowedError,
+    UnresolvedSubmissionError,
+    compute_unwind_legs,
+    estimate_worst_case_unwind_loss,
+    execute_opportunity,
+)
+from execution.store import OrderStore
 from kalshi.client import AmbiguousSubmissionError, ExchangeError, KalshiClient, OrderAction, OrderResult, OrderStatus, Orderbook, OrderbookLevel, Side, TimeInForce
-from scanner.basket import LegQuote, compute_opportunity
+from scanner.basket import LegQuote, compute_no_opportunity, compute_opportunity
 
 BUY_MAX = Decimal("0.98")
 MIN_DEPTH = Decimal("25")
@@ -60,6 +70,7 @@ class FakeKalshiClient:
         self.cancel_calls: list[str] = []
         self._canceled: set[str] = set()
         self.get_order_calls: list[str] = []
+        self.get_orderbook_calls: list[tuple[str, Side]] = []
         self._fills = fills or {}
         self._unwind_fills = unwind_fills or {}
         self._unwind_fill_batches = unwind_fill_batches
@@ -128,6 +139,7 @@ class FakeKalshiClient:
         return last_result
 
     async def get_orderbook(self, ticker, side=Side.YES, depth=None):
+        self.get_orderbook_calls.append((ticker, side))
         levels = self._book_bids.get(ticker, [(Decimal("0.01"), Decimal("100000"))])
         return Orderbook(
             market_id=ticker,
@@ -147,6 +159,20 @@ def buy_basket_opportunity():
         _leg("HIKE25", "0.03", 45, "0.01", 45),
     ]
     return compute_opportunity("KXFED-26SEP", legs, BUY_MAX, MIN_DEPTH)
+
+
+@pytest.fixture
+def buy_all_no_opportunity():
+    # Same 4-ticker/45-contract-floor shape as buy_basket_opportunity, but
+    # priced so the bid side is overpriced (sum(bids)=1.20) — see
+    # tests/test_basket.py's matching detection test for the fee/edge math.
+    legs = [
+        _leg("CUT50", "0.32", 120, "0.30", 120),
+        _leg("CUT25", "0.32", 340, "0.30", 340),
+        _leg("NOCHG", "0.32", 500, "0.30", 500),
+        _leg("HIKE25", "0.32", 45, "0.30", 45),
+    ]
+    return compute_no_opportunity("KXFED-26SEP", legs, Decimal("0.02"), MIN_DEPTH)
 
 
 # ---- compute_unwind_legs (pure) ----
@@ -471,3 +497,147 @@ async def test_entry_with_uncancellable_live_order_halts(buy_basket_opportunity)
     with pytest.raises(UnresolvedSubmissionError) as excinfo:
         await execute_opportunity(client, buy_basket_opportunity)
     assert "unverified or non-terminal" in str(excinfo.value)
+
+
+# --- buy_all_no direction (validation-gated — see execution.allow_no_direction) --
+
+
+@pytest.mark.asyncio
+async def test_no_direction_refused_when_not_explicitly_allowed(buy_all_no_opportunity):
+    """Default allow_no_direction=False must refuse before anything reaches
+    the exchange — a detected buy_all_no opportunity is logged upstream but
+    must never silently reach execute_opportunity's submission path."""
+    client = FakeKalshiClient()
+    with pytest.raises(NoDirectionNotAllowedError):
+        await execute_opportunity(client, buy_all_no_opportunity)
+    assert client.batch_calls == []
+
+
+@pytest.mark.asyncio
+async def test_no_direction_entry_buys_no_side_at_synthesized_ask(buy_all_no_opportunity):
+    client = FakeKalshiClient()   # every leg fills fully
+    result = await execute_opportunity(client, buy_all_no_opportunity, allow_no_direction=True)
+
+    orders = client.batch_calls[0]
+    assert {o.market_id for o in orders} == {"CUT50", "CUT25", "NOCHG", "HIKE25"}
+    assert all(o.side == Side.NO and o.action == OrderAction.BUY for o in orders)
+    # no_ask = 1 - best_bid = 1 - 0.30 = 0.70 for every leg in this fixture.
+    assert all(o.limit_price == Decimal("0.70") for o in orders)
+    assert all(o.size == buy_all_no_opportunity.max_size == Decimal("45") for o in orders)
+    assert result.mismatched is False
+    assert result.unwind_confirmed is True
+
+
+@pytest.mark.asyncio
+async def test_no_direction_uneven_fills_unwind_sells_no_side_at_synthesized_bid(buy_all_no_opportunity):
+    client = FakeKalshiClient(reject_tickers=frozenset({"NOCHG"}))
+    result = await execute_opportunity(client, buy_all_no_opportunity, allow_no_direction=True)
+
+    assert result.mismatched is True
+    assert result.unwind_confirmed is True
+    unwind_orders = client.batch_calls[1]
+    assert {o.market_id for o in unwind_orders} == {"CUT50", "CUT25", "HIKE25"}
+    assert all(o.side == Side.NO and o.action == OrderAction.SELL for o in unwind_orders)
+    # no_bid = 1 - best_ask = 1 - 0.32 = 0.68 for every leg in this fixture.
+    assert all(o.limit_price == Decimal("0.68") for o in unwind_orders)
+    assert all(o.size == Decimal("45") for o in unwind_orders)
+
+
+@pytest.mark.asyncio
+async def test_no_direction_refreshed_book_fallback_reads_the_no_side_book(buy_all_no_opportunity, monkeypatch):
+    """A NO-basket's unwind must refresh depth from the NO side of the
+    book, not the YES side — reading the wrong side would price the
+    fallback off a completely different market."""
+    monkeypatch.setattr("execution.executor._UNWIND_CONFIRM_POLL_INTERVAL_S", 0.001)
+    monkeypatch.setattr("execution.executor._UNWIND_CONFIRM_TIMEOUT_S", 0.005)
+    client = FakeKalshiClient(
+        reject_tickers=frozenset({"NOCHG"}),
+        unwind_fill_batches=[{"CUT50": Decimal("0")}, {}],
+        book_bids={"CUT50": [(Decimal("0.60"), Decimal("45"))]},
+    )
+
+    result = await execute_opportunity(client, buy_all_no_opportunity, allow_no_direction=True)
+
+    assert result.unwind_confirmed is True
+    assert result.refreshed_book_fallback_used is True
+    assert ("CUT50", Side.NO) in client.get_orderbook_calls
+    assert client.batch_calls[2][0].limit_price == Decimal("0.60")
+    assert client.batch_calls[2][0].side == Side.NO
+
+
+# --- OrderStore integration (2026 merge) -------------------------------------
+# store=None (the default) is exercised by every test above; these cover the
+# opt-in path — additive instrumentation, not a change to the unwind/
+# reconciliation logic itself.
+
+
+@pytest.mark.asyncio
+async def test_store_records_every_leg_before_submission_and_updates_to_terminal(buy_basket_opportunity, tmp_path):
+    store = OrderStore.open(tmp_path / "orders.db")
+    result = await execute_opportunity(FakeKalshiClient(), buy_basket_opportunity, store=store)
+
+    assert result.mismatched is False
+    for leg in result.leg_results:
+        assert leg.client_order_id
+        record = store.get(leg.client_order_id)
+        assert record is not None
+        assert record.ticker == leg.ticker
+        assert record.status == "filled"
+        assert record.terminal_verified is True
+        assert record.filled_size == leg.order_result.filled_size
+        assert record.execution_stage == "entry"
+
+
+@pytest.mark.asyncio
+async def test_store_records_unwind_legs_under_their_own_stage(buy_basket_opportunity, tmp_path):
+    store = OrderStore.open(tmp_path / "orders.db")
+    client = FakeKalshiClient(reject_tickers=frozenset({"NOCHG"}))
+    result = await execute_opportunity(client, buy_basket_opportunity, store=store)
+
+    assert result.mismatched is True
+    assert result.unwind_results   # NOCHG's rejection triggered an unwind of the other 3
+    for leg in result.unwind_results:
+        record = store.get(leg.client_order_id)
+        assert record is not None
+        assert record.execution_stage == "unwind"
+        assert record.action == "sell"
+
+
+@pytest.mark.asyncio
+async def test_store_leaves_a_durable_submitted_row_when_placement_crashes(buy_basket_opportunity, tmp_path):
+    """The property this store exists for: record_submitted runs before
+    place_orders_batch is even awaited (see execution/store.py's module
+    docstring), so a genuine crash inside that call — not a clean
+    ExchangeError, an unexpected exception — still leaves a durable,
+    queryable 'submitted but unconfirmed' row rather than silence."""
+
+    class _CrashingClient(FakeKalshiClient):
+        async def place_orders_batch(self, orders):
+            raise RuntimeError("simulated crash mid-submission")
+
+    store = OrderStore.open(tmp_path / "orders.db")
+    client = _CrashingClient()
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await execute_opportunity(client, buy_basket_opportunity, store=store)
+
+    # The four entry orders were each recorded before the crashing call.
+    submitted_rows = [
+        store.get(cid) for cid in [
+            row["client_order_id"] for row in
+            store._conn.execute("SELECT client_order_id FROM orders").fetchall()
+        ]
+    ]
+    assert len(submitted_rows) == 4
+    assert all(r.status == "submitted" and r.terminal_verified is False for r in submitted_rows)
+    assert {r.ticker for r in submitted_rows} == {"CUT50", "CUT25", "NOCHG", "HIKE25"}
+
+
+@pytest.mark.asyncio
+async def test_store_none_is_the_default_and_changes_nothing(buy_basket_opportunity):
+    """No store argument at all must behave identically to every test above
+    this section — confirms store is purely additive."""
+    client = FakeKalshiClient()
+    result = await execute_opportunity(client, buy_basket_opportunity)
+    assert result.mismatched is False
+    assert all(leg.client_order_id for leg in result.leg_results)   # populated regardless of store

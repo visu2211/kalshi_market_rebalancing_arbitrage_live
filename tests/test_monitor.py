@@ -15,6 +15,9 @@ from execution.executor import AtomicExecutionResult, LegExecutionResult
 from kalshi.client import ExchangeError, OrderAction, Orderbook, OrderbookLevel, RateLimitError, Side
 from kalshi.ws_client import WS_RECONNECTED_MESSAGE_TYPE
 from scanner.basket import BasketOpportunity, LegQuote
+from execution.risk import RiskState
+from execution.store import OrderStore
+from scanner.relationships import Relationship
 from stream.monitor import (
     _BALANCE_CACHE_TTL_S,
     run_stage3,
@@ -25,6 +28,7 @@ from stream.monitor import (
     _confirm_opportunity_via_rest,
     _reconcile_positions,
     _realized_unwind_loss,
+    _reprice_event,
     _unmatched_entry_exposure,
     _update_believed_positions,
     _write_scanner_status,
@@ -94,6 +98,60 @@ def test_best_yes_quote_none_when_one_side_empty():
     book = LocalBook()
     book.apply_snapshot(yes_levels=[(Decimal("0.40"), Decimal("100"))], no_levels=[])
     assert book.best_yes_quote() is None
+
+
+# --- depth-aware accessors (2026 merge — read path only, storage unchanged) --
+
+
+def _depth_book():
+    book = LocalBook()
+    book.apply_snapshot(
+        yes_levels=[(Decimal("0.40"), Decimal("100")), (Decimal("0.38"), Decimal("50")), (Decimal("0.35"), Decimal("20"))],
+        no_levels=[(Decimal("0.55"), Decimal("80")), (Decimal("0.58"), Decimal("30")), (Decimal("0.60"), Decimal("10"))],
+    )
+    return book
+
+
+def test_yes_ask_levels_walks_no_bids_ascending_price():
+    book = _depth_book()
+    levels = book.yes_ask_levels(depth=3)
+    # no_bids 0.55/0.58/0.60 -> synthesized YES asks 0.45/0.42/0.40, cheapest first.
+    assert [l.price for l in levels] == [Decimal("0.40"), Decimal("0.42"), Decimal("0.45")]
+    assert [l.size for l in levels] == [Decimal("10"), Decimal("30"), Decimal("80")]
+
+
+def test_yes_bid_levels_walks_yes_bids_descending_price():
+    book = _depth_book()
+    levels = book.yes_bid_levels(depth=3)
+    assert [l.price for l in levels] == [Decimal("0.40"), Decimal("0.38"), Decimal("0.35")]
+    assert [l.size for l in levels] == [Decimal("100"), Decimal("50"), Decimal("20")]
+
+
+def test_yes_ask_levels_respects_depth_limit():
+    book = _depth_book()
+    assert len(book.yes_ask_levels(depth=1)) == 1
+    assert len(book.yes_ask_levels(depth=2)) == 2
+    assert len(book.yes_ask_levels(depth=100)) == 3   # never more than what's actually resting
+
+
+def test_yes_ask_levels_empty_when_no_bids_empty():
+    book = LocalBook()
+    book.apply_snapshot(yes_levels=[(Decimal("0.40"), Decimal("100"))], no_levels=[])
+    assert book.yes_ask_levels(depth=5) == []
+
+
+def test_yes_ask_and_bid_levels_at_depth_one_match_best_yes_quote():
+    """The acceptance gate for depth-aware pricing: at depth=1 the new
+    accessors must return exactly the same top-of-book price/size
+    best_yes_quote already returns, so scanner.basket.compute_opportunity_depth_aware
+    can reproduce compute_opportunity's output byte-for-byte at depth=1."""
+    book = _depth_book()
+    best_ask, ask_size, best_bid, bid_size = book.best_yes_quote()
+
+    ask_levels = book.yes_ask_levels(depth=1)
+    bid_levels = book.yes_bid_levels(depth=1)
+    assert (ask_levels[0].price, ask_levels[0].size) == (best_ask, ask_size)
+    assert (bid_levels[0].price, bid_levels[0].size) == (best_bid, bid_size)
 
 
 def test_apply_delta_is_relative_not_absolute():
@@ -681,3 +739,101 @@ async def test_stage1_backoff_is_capped_at_the_rescan_interval(tmp_path, monkeyp
 
     assert max(slept) == settings.scanner.rescan_interval_s
     assert slept[-1] == settings.scanner.rescan_interval_s
+
+
+def _fresh_book(ask=Decimal("0.25"), size=Decimal("100")):
+    """A coherent, fully-populated, just-snapshotted book: best_yes_quote()
+    returns (1-ask, size, ask-0.05, size) — i.e. best_ask == 1-ask."""
+    book = LocalBook()
+    book.apply_snapshot(
+        yes_levels=[(ask - Decimal("0.05"), size)],
+        no_levels=[(Decimal(1) - ask, size)],
+    )
+    return book
+
+
+@pytest.mark.asyncio
+async def test_reprice_event_dispatches_to_every_relationship_owning_the_ticker(tmp_path):
+    """Regression test for the fan-out bug: event_by_ticker used to be a
+    strict dict[str, EventCandidate] built via {t: c for c in shortlist for
+    t in c.leg_tickers} — if a ticker belonged to two relationships, the
+    second construction silently clobbered the first, and _reprice_event's
+    single .get(ticker) lookup could only ever re-price one of them. Ticker
+    "X" here belongs to both relationships; both must be re-priced off one
+    book update, and neither's opportunity may be lost or overwritten by
+    the other's."""
+    settings = _stage1_settings(tmp_path)   # BASE_CONFIG: buy_basket_max_cost_usd=0.98, min_depth_contracts=1
+
+    r1 = Relationship(
+        event_ticker="EVT-R1", title="R1", leg_tickers=["X", "Y"],
+        leg_volume_24h={}, expected_settlement_time=datetime.now(timezone.utc),
+    )
+    r2 = Relationship(
+        event_ticker="EVT-R2", title="R2", leg_tickers=["X", "Z"],
+        leg_volume_24h={}, expected_settlement_time=datetime.now(timezone.utc),
+    )
+    relationships_by_ticker = {"X": [r1, r2], "Y": [r1], "Z": [r2]}
+    relationship_by_event_ticker = {r1.event_ticker: r1, r2.event_ticker: r2}
+
+    # best_ask == 0.30 on every leg (well under the 0.98 threshold once
+    # summed across 2 legs plus fees), coherent, fresh, ample depth.
+    books = {"X": _fresh_book(), "Y": _fresh_book(), "Z": _fresh_book()}
+    open_opportunities: dict = {}
+    detection_diagnostics = {
+        "fully_priced_evaluations": 0,
+        "stale_book_rejections": 0,
+        "incomplete_book_rejections": 0,
+        "incoherent_book_rejections": 0,
+        "insufficient_depth_rejections": 0,
+        "price_threshold_rejections": 0,
+        "closest_baskets": {},
+    }
+
+    await _reprice_event(
+        "X", books, relationships_by_ticker, relationship_by_event_ticker, settings,
+        open_opportunities, executed_opportunities=set(), execution_client=None, market_data_client=None,
+        balance_cache=_BalanceCache(), circuit_breaker=_CircuitBreaker(max_mismatches=1),
+        believed_positions={}, risk_state=RiskState.empty(datetime.now(timezone.utc)),
+        detection_diagnostics=detection_diagnostics,
+    )
+
+    assert set(open_opportunities) == {"EVT-R1", "EVT-R2"}
+    assert set(open_opportunities["EVT-R1"].legs) == {"X", "Y"}
+    assert set(open_opportunities["EVT-R2"].legs) == {"X", "Z"}
+
+
+@pytest.mark.asyncio
+async def test_reprice_event_records_detected_opportunities_to_the_store_when_given(tmp_path):
+    """Proves the Phase E wiring actually reaches OrderStore.record_opportunity
+    from the live detection path (_reprice_event -> _reprice_relationship),
+    not just that the two compile together — store=None (every test above
+    this one) must remain unaffected."""
+    settings = _stage1_settings(tmp_path)
+    r1 = Relationship(
+        event_ticker="EVT-R1", title="R1", leg_tickers=["X", "Y"],
+        leg_volume_24h={}, expected_settlement_time=datetime.now(timezone.utc),
+    )
+    relationships_by_ticker = {"X": [r1], "Y": [r1]}
+    relationship_by_event_ticker = {r1.event_ticker: r1}
+    books = {"X": _fresh_book(), "Y": _fresh_book()}
+    open_opportunities: dict = {}
+    detection_diagnostics = {
+        "fully_priced_evaluations": 0, "stale_book_rejections": 0, "incomplete_book_rejections": 0,
+        "incoherent_book_rejections": 0, "insufficient_depth_rejections": 0, "price_threshold_rejections": 0,
+        "closest_baskets": {},
+    }
+    store = OrderStore.open(tmp_path / "orders.db")
+
+    await _reprice_event(
+        "X", books, relationships_by_ticker, relationship_by_event_ticker, settings,
+        open_opportunities, executed_opportunities=set(), execution_client=None, market_data_client=None,
+        balance_cache=_BalanceCache(), circuit_breaker=_CircuitBreaker(max_mismatches=1),
+        believed_positions={}, risk_state=RiskState.empty(datetime.now(timezone.utc)),
+        detection_diagnostics=detection_diagnostics, store=store,
+    )
+
+    assert "EVT-R1" in open_opportunities
+    recorded = store.get_opportunities("EVT-R1")
+    assert len(recorded) == 1
+    assert recorded[0].direction == "buy_basket"
+    assert set(recorded[0].legs) == {"X", "Y"}

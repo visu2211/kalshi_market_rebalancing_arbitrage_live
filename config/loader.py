@@ -52,6 +52,13 @@ class ArbSettings:
 
 
 @dataclass(frozen=True)
+class RelationshipsSettings:
+    trust_auto_detected: bool                      # default True — auto-detected (mutually_exclusive+MECNET) events keep trading exactly as before
+    manual_config_path: Optional[Path]              # config/relationships.yaml — safe to commit, no secrets
+    verified_event_tickers: frozenset[str]          # loaded from manual_config_path; empty when unset, so scanner.relationships.build_relationships is a no-op wrapper by default
+
+
+@dataclass(frozen=True)
 class LoggingSettings:
     level: str
     opportunities_log_path: Path
@@ -69,6 +76,7 @@ class ExecutionSettings:
     risk_state_path: Path
     circuit_breaker_max_mismatches: int
     max_order_size_contracts: Decimal      # caps every leg's requested size regardless of the opportunity's computed max_size — the deliberate ramp-up lever for real money
+    allow_no_direction: bool               # default False — gates BasketOpportunity.direction=="buy_all_no" out of execute_opportunity entirely; economically the same trade as the deleted sell_basket direction, see execution/executor.py and scanner/basket.py's compute_no_opportunity
     prod_enabled: bool
     require_rest_confirmation: bool    # re-read every leg's book from Kalshi before submitting
     prod_unconfirmed_orders_acknowledged: bool   # explicit opt-in to run prod WITHOUT that re-read
@@ -94,6 +102,7 @@ class Settings:
     kalshi: KalshiSettings
     scanner: ScannerSettings
     arb: ArbSettings
+    relationships: RelationshipsSettings
     logging: LoggingSettings
     execution: ExecutionSettings
 
@@ -106,6 +115,17 @@ def load_settings(path: Path = DEFAULT_SETTINGS_PATH) -> Settings:
 
     def _section(name: str) -> Mapping[str, Any]:
         value = raw.get(name)
+        if not isinstance(value, Mapping):
+            raise ConfigurationError(f"{name} must be a mapping")
+        return value
+
+    def _optional_section(name: str) -> Mapping[str, Any]:
+        """Like _section, but a missing key defaults to {} instead of
+        raising — for new, additive sections that must not break a
+        settings.yaml written before they existed."""
+        value = raw.get(name)
+        if value is None:
+            return {}
         if not isinstance(value, Mapping):
             raise ConfigurationError(f"{name} must be a mapping")
         return value
@@ -152,6 +172,7 @@ def load_settings(path: Path = DEFAULT_SETTINGS_PATH) -> Settings:
     kalshi_raw = _section("kalshi")
     scanner_raw = _section("scanner")
     arb_raw = _section("arb")
+    relationships_raw = _optional_section("relationships")
     logging_raw = _section("logging")
     execution_raw = _section("execution")
 
@@ -160,6 +181,10 @@ def load_settings(path: Path = DEFAULT_SETTINGS_PATH) -> Settings:
         raise ConfigurationError("execution.target must be exactly 'demo' or 'prod'")
     enabled = _bool(_required(execution_raw, "enabled", "execution"), "execution.enabled")
     prod_enabled = _bool(execution_raw.get("prod_enabled", False), "execution.prod_enabled")
+    # Default False — same "ship disabled, ramp up manually" posture as
+    # max_order_size_contracts. buy_all_no is economically the same trade as
+    # the deleted sell_basket direction; see execution/executor.py.
+    allow_no_direction = _bool(execution_raw.get("allow_no_direction", False), "execution.allow_no_direction")
     # Defaults to True: bypassing it is an explicit, deliberate opt-out, and it
     # is refused outright for production below.
     require_rest_confirmation = _bool(
@@ -209,6 +234,29 @@ def load_settings(path: Path = DEFAULT_SETTINGS_PATH) -> Settings:
         p = Path(rel_or_abs)
         return p if p.is_absolute() else project_root / p
 
+    trust_auto_detected = _bool(
+        relationships_raw.get("trust_auto_detected", True), "relationships.trust_auto_detected"
+    )
+    manual_config_path_raw = relationships_raw.get("manual_config_path")
+    manual_config_path = _resolve(manual_config_path_raw) if manual_config_path_raw else None
+    verified_event_tickers: frozenset[str] = frozenset()
+    if manual_config_path is not None:
+        # Fail closed: a configured-but-missing/malformed manual relationship
+        # file must not silently degrade to "no manual verification" — that
+        # would look identical to trust_auto_detected's own default and hide
+        # a real config mistake.
+        if not manual_config_path.is_file():
+            raise ConfigurationError(f"relationships.manual_config_path not found: {manual_config_path}")
+        manual_raw = yaml.safe_load(manual_config_path.read_text()) or {}
+        if not isinstance(manual_raw, Mapping):
+            raise ConfigurationError(f"{manual_config_path} must contain a YAML mapping")
+        tickers = manual_raw.get("verified_event_tickers", [])
+        if not isinstance(tickers, list) or not all(isinstance(t, str) and t for t in tickers):
+            raise ConfigurationError(
+                f"{manual_config_path}: verified_event_tickers must be a list of non-empty strings"
+            )
+        verified_event_tickers = frozenset(tickers)
+
     opportunities_log_path = _resolve(logging_raw["opportunities_log_path"])
     status_path = _resolve(logging_raw["status_path"])
     orders_log_path = _resolve(execution_raw["orders_log_path"])
@@ -252,6 +300,11 @@ def load_settings(path: Path = DEFAULT_SETTINGS_PATH) -> Settings:
         arb=ArbSettings(
             buy_basket_max_cost_usd=_decimal(_required(arb_raw, "buy_basket_max_cost_usd", "arb"), "arb.buy_basket_max_cost_usd", strictly_positive=True, maximum="1"),
         ),
+        relationships=RelationshipsSettings(
+            trust_auto_detected=trust_auto_detected,
+            manual_config_path=manual_config_path,
+            verified_event_tickers=verified_event_tickers,
+        ),
         logging=LoggingSettings(
             level=str(_required(logging_raw, "level", "logging")).upper(),
             opportunities_log_path=opportunities_log_path,
@@ -267,6 +320,7 @@ def load_settings(path: Path = DEFAULT_SETTINGS_PATH) -> Settings:
             risk_state_path=risk_state_path,
             circuit_breaker_max_mismatches=_int(_required(execution_raw, "circuit_breaker_max_mismatches", "execution"), "execution.circuit_breaker_max_mismatches", minimum=1),
             max_order_size_contracts=_decimal(_required(execution_raw, "max_order_size_contracts", "execution"), "execution.max_order_size_contracts", strictly_positive=True),
+            allow_no_direction=allow_no_direction,
             prod_enabled=prod_enabled,
             require_rest_confirmation=require_rest_confirmation,
             prod_unconfirmed_orders_acknowledged=prod_unconfirmed_ack,

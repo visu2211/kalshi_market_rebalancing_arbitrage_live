@@ -152,3 +152,58 @@ def test_rest_confirmation_defaults_to_required_when_absent(tmp_path: Path) -> N
     config = deepcopy(BASE_CONFIG)
     config["execution"].pop("require_rest_confirmation", None)
     assert load_settings(_write(tmp_path, config)).execution.require_rest_confirmation is True
+
+
+def test_allow_no_direction_defaults_false(tmp_path: Path) -> None:
+    """BASE_CONFIG has no allow_no_direction key — the same 'ship disabled
+    by default' posture as max_order_size_contracts must hold even for a
+    settings.yaml written before this flag existed."""
+    settings = load_settings(_write(tmp_path, deepcopy(BASE_CONFIG)))
+    assert settings.execution.allow_no_direction is False
+
+
+def test_allow_no_direction_can_be_explicitly_enabled(tmp_path: Path) -> None:
+    config = deepcopy(BASE_CONFIG)
+    config["execution"]["allow_no_direction"] = True
+    settings = load_settings(_write(tmp_path, config))
+    assert settings.execution.allow_no_direction is True
+
+
+def test_relationships_section_absent_defaults_to_trust_auto_detected(tmp_path: Path) -> None:
+    """BASE_CONFIG has no `relationships` key at all — this is the exact
+    shape of every settings.yaml written before this section existed, and
+    must load with today's unchanged behavior rather than raising."""
+    settings = load_settings(_write(tmp_path, deepcopy(BASE_CONFIG)))
+    assert settings.relationships.trust_auto_detected is True
+    assert settings.relationships.manual_config_path is None
+    assert settings.relationships.verified_event_tickers == frozenset()
+
+
+def test_relationships_manual_config_path_must_exist(tmp_path: Path) -> None:
+    config = deepcopy(BASE_CONFIG)
+    config["relationships"] = {"manual_config_path": "config/relationships.yaml"}
+    with pytest.raises(ConfigurationError, match="manual_config_path not found"):
+        load_settings(_write(tmp_path, config))
+
+
+def test_relationships_manual_config_loads_verified_tickers(tmp_path: Path) -> None:
+    config = deepcopy(BASE_CONFIG)
+    config["relationships"] = {"trust_auto_detected": False, "manual_config_path": "config/relationships.yaml"}
+    settings_path = _write(tmp_path, config)
+    (settings_path.parent / "relationships.yaml").write_text(
+        yaml.safe_dump({"verified_event_tickers": ["KXFED-1", "KXNBA-1"]})
+    )
+    settings = load_settings(settings_path)
+    assert settings.relationships.trust_auto_detected is False
+    assert settings.relationships.verified_event_tickers == frozenset({"KXFED-1", "KXNBA-1"})
+
+
+def test_relationships_manual_config_rejects_non_string_tickers(tmp_path: Path) -> None:
+    config = deepcopy(BASE_CONFIG)
+    config["relationships"] = {"manual_config_path": "config/relationships.yaml"}
+    settings_path = _write(tmp_path, config)
+    (settings_path.parent / "relationships.yaml").write_text(
+        yaml.safe_dump({"verified_event_tickers": ["KXFED-1", 123]})
+    )
+    with pytest.raises(ConfigurationError, match="verified_event_tickers"):
+        load_settings(settings_path)

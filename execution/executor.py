@@ -35,11 +35,19 @@ of that, every entry order uses Kalshi's native fill_or_kill time in force:
 each individual leg fills completely or is killed. This prevents partial
 fills within one leg, but does not make separate legs atomic.
 
-Buy-basket only (rebuilt 2026-08-26 after a real incident): every
-BasketOpportunity is a buy_basket now — see scanner/basket.py and
-README.md's "What's deliberately not implemented" for why the opposite
-(sell_basket) direction was dropped rather than shipped. That
-simplification is why unwinding is always a SELL below, never a BUY-to-cover.
+Two directions, one always a SELL to exit: BasketOpportunity.direction is
+either "buy_basket" (buy YES on every leg, rebuilt 2026-08-26 after a real
+incident) or "buy_all_no" (buy NO on every leg — see
+scanner/basket.py's compute_no_opportunity docstring for why this is
+economically the same trade as the sell_basket direction this repo built
+once and deliberately deleted 2026-08-26 as never validated live).
+_position_side/_entry_price/_exit_price/_exit_depth below resolve which
+Kalshi contract side and price each direction actually trades; unwinding
+is always a SELL of whichever side was entered, never a BUY-to-cover.
+allow_no_direction (execute_opportunity's parameter, backed by
+execution.allow_no_direction, default False) gates buy_all_no out of
+execution entirely until deliberately enabled — the same "ship disabled,
+ramp up manually" posture as max_order_size_contracts.
 
 Batched, atomic-attempt, unwind-on-mismatch, confirmed: every leg used to
 be placed sequentially, one round-trip at a time, fire-and-forget. Against
@@ -106,7 +114,8 @@ from kalshi.client import (
     Side,
     TimeInForce,
 )
-from scanner.basket import BasketOpportunity
+from execution.store import OrderStore, PendingOrder
+from scanner.basket import BasketOpportunity, LegQuote
 from scanner.fees import taker_fee
 
 _UNWIND_CONFIRM_POLL_INTERVAL_S = 0.5
@@ -138,6 +147,11 @@ class LegExecutionResult:
     # survived cancellation. An unverified leg may still be working at the
     # exchange, so its fill count is a guess and must not be treated as final.
     terminal_verified: bool = True
+    # The client_order_id this leg was submitted under. Populated even when
+    # order_result is None (a request-level rejection has no OrderResult to
+    # carry it), so execution/store.py's OrderStore can always be updated by
+    # key — order_result.client_order_id alone isn't reachable in that case.
+    client_order_id: str = ""
 
 
 @dataclass
@@ -164,20 +178,56 @@ class AtomicExecutionResult:
     unwind_attempt_count: int = 0
 
 
+def _position_side(direction: str) -> Side:
+    """Which Kalshi contract side a basket in this direction holds long.
+    buy_basket buys YES on every leg; buy_all_no buys NO on every leg (see
+    scanner/basket.py's compute_no_opportunity). Unwinding always trades
+    this same side — exiting a long YES position means selling YES,
+    exiting a long NO position means selling NO."""
+    return Side.YES if direction == "buy_basket" else Side.NO
+
+
+def _entry_price(direction: str, leg: LegQuote) -> Decimal:
+    """The price scanner.basket priced this leg's entry at: leg.best_ask
+    for buy_basket, or the synthesized NO ask (1 - leg.best_bid) for
+    buy_all_no — Kalshi's book is bid-only per side, so a NO-basket's ask
+    is synthesized off the YES bid exactly as scanner/basket.py already
+    synthesizes a YES ask off the NO bid."""
+    return leg.best_ask if direction == "buy_basket" else Decimal(1) - leg.best_bid
+
+
+def _exit_price(direction: str, leg: LegQuote) -> Decimal:
+    """The best price currently available to flatten one contract of this
+    leg's held position: leg.best_bid for a held YES contract, or the
+    synthesized NO bid (1 - leg.best_ask) for a held NO contract."""
+    return leg.best_bid if direction == "buy_basket" else Decimal(1) - leg.best_ask
+
+
+def _exit_depth(direction: str, leg: LegQuote) -> Decimal:
+    """Displayed size backing _exit_price: leg.bid_size (the YES bid
+    ladder) for a YES exit, or leg.ask_size (synthesized from the same
+    no_bids ladder that prices the YES ask — see kalshi.client.get_orderbook's
+    side=NO synthesis, which mirrors this exactly) for a NO exit."""
+    return leg.bid_size if direction == "buy_basket" else leg.ask_size
+
+
 def estimate_worst_case_unwind_loss(opportunity: BasketOpportunity) -> Decimal | None:
     """Conservative loss if every proposed leg had to be sold immediately.
 
-    Returns None when the displayed best bid cannot absorb the full proposed
-    size on any leg.  Summing every leg is stricter than the most common
-    mismatch, but safely covers any subset of entry legs filling.
+    Returns None when the displayed exit depth cannot absorb the full
+    proposed size on any leg. Summing every leg is stricter than the most
+    common mismatch, but safely covers any subset of entry legs filling.
     """
     total = Decimal(0)
     for leg in opportunity.leg_quotes:
-        if leg.bid_size < opportunity.max_size or leg.best_bid <= 0:
+        exit_price = _exit_price(opportunity.direction, leg)
+        exit_depth = _exit_depth(opportunity.direction, leg)
+        if exit_depth < opportunity.max_size or exit_price <= 0:
             return None
-        entry_fee = taker_fee(leg.best_ask, opportunity.max_size, opportunity.fee_multiplier)
-        exit_fee = taker_fee(leg.best_bid, opportunity.max_size, opportunity.fee_multiplier)
-        total += (leg.best_ask - leg.best_bid) * opportunity.max_size + entry_fee + exit_fee
+        entry_price = _entry_price(opportunity.direction, leg)
+        entry_fee = taker_fee(entry_price, opportunity.max_size, opportunity.fee_multiplier)
+        exit_fee = taker_fee(exit_price, opportunity.max_size, opportunity.fee_multiplier)
+        total += (entry_price - exit_price) * opportunity.max_size + entry_fee + exit_fee
     return max(total, Decimal(0))
 
 
@@ -225,10 +275,12 @@ async def _submit_unwind_stage(
     legs: list[UnwindLeg],
     prices: dict[str, Decimal],
     kind: str,
+    side: Side = Side.YES,
+    store: Optional[OrderStore] = None,
 ) -> list[LegExecutionResult]:
     orders = [
         OrderRequest(
-            market_id=leg.ticker, side=Side.YES, action=OrderAction.SELL,
+            market_id=leg.ticker, side=side, action=OrderAction.SELL,
             order_type=OrderType.LIMIT, size=leg.excess_size,
             limit_price=prices[leg.ticker], client_order_id=_new_client_order_id(kind),
             time_in_force=TimeInForce.IMMEDIATE_OR_CANCEL,
@@ -237,10 +289,10 @@ async def _submit_unwind_stage(
     ]
     if not orders:
         return []
-    results = await _place_batch(client, orders, OrderAction.SELL)
+    results = await _place_batch(client, orders, OrderAction.SELL, store=store, execution_stage=kind)
     for result in results:
         result.execution_stage = kind
-    await _reconcile_final_states(client, results)
+    await _reconcile_final_states(client, results, store=store)
     await _confirm_unwind(client, results)
     return results
 
@@ -250,6 +302,19 @@ def _format_order_error(raw: dict) -> str:
     if isinstance(error, dict):
         return f"{error.get('code', 'unknown_error')}: {error.get('message', '')}".strip(": ")
     return str(error)
+
+
+class NoDirectionNotAllowedError(Exception):
+    """Raised by execute_opportunity when asked to submit a buy_all_no
+    basket while allow_no_direction is False (the default).
+
+    buy_all_no is economically the same trade as the sell_basket direction
+    this repo built once and deliberately deleted 2026-08-26 as never
+    validated live — see scanner/basket.py's compute_no_opportunity and
+    config/loader.py's execution.allow_no_direction. Raised rather than
+    silently skipped so a caller that expects execution to have happened
+    cannot mistake this for a clean no-op.
+    """
 
 
 class UnresolvedSubmissionError(Exception):
@@ -292,6 +357,7 @@ async def _resolve_ambiguous_batch(
                 ticker=o.market_id, action=action, limit_price=o.limit_price, size=o.size,
                 order_result=None,
                 error=f"AMBIGUOUS — submission unresolved: {exc}; lookup also failed: {lookup_exc}",
+                client_order_id=o.client_order_id or "",
             )
             for o in orders
         ]
@@ -306,6 +372,7 @@ async def _resolve_ambiguous_batch(
             ticker=order.market_id, action=action, limit_price=order.limit_price, size=order.size,
             order_result=found,
             error=None if found is not None else f"not accepted by the exchange (resolved after: {exc})",
+            client_order_id=order.client_order_id or "",
         ))
     logger.warning(
         "ambiguous_submission_resolved",
@@ -318,11 +385,27 @@ async def _place_batch(
     demo_client: KalshiClient,
     orders: list[OrderRequest],
     action: OrderAction,
+    store: Optional[OrderStore] = None,
+    execution_stage: str = "entry",
 ) -> list[LegExecutionResult]:
     """Places `orders` in one batch call and maps the result back to
     LegExecutionResult per order, whether the failure was request-level
     (ExchangeError on the whole call) or per-order (a REJECTED
-    OrderResult inside an otherwise-successful batch response)."""
+    OrderResult inside an otherwise-successful batch response).
+
+    If `store` is given, every order is recorded as submitted-but-unconfirmed
+    BEFORE place_orders_batch is even called — see execution/store.py's
+    module docstring for why that ordering matters (a crash here must still
+    leave a durable, queryable row, not silence)."""
+    if store is not None:
+        store.record_submitted([
+            PendingOrder(
+                client_order_id=o.client_order_id or "", ticker=o.market_id,
+                side=o.side.value, action=o.action.value, execution_stage=execution_stage,
+                limit_price=o.limit_price, size=o.size,
+            )
+            for o in orders if o.client_order_id
+        ])
     try:
         order_results = await demo_client.place_orders_batch(orders)
     except AmbiguousSubmissionError as exc:
@@ -336,7 +419,10 @@ async def _place_batch(
         # A clean rejection (4xx/429) — the exchange definitively did not
         # accept these, so zero fills is the truthful reading.
         return [
-            LegExecutionResult(ticker=o.market_id, action=action, limit_price=o.limit_price, size=o.size, order_result=None, error=str(exc))
+            LegExecutionResult(
+                ticker=o.market_id, action=action, limit_price=o.limit_price, size=o.size,
+                order_result=None, error=str(exc), client_order_id=o.client_order_id or "",
+            )
             for o in orders
         ]
 
@@ -348,6 +434,7 @@ async def _place_batch(
             size=order.size,
             order_result=result,
             error=_format_order_error(result.raw) if result.status == OrderStatus.REJECTED else None,
+            client_order_id=order.client_order_id or "",
         )
         for order, result in zip(orders, order_results)
     ]
@@ -406,9 +493,32 @@ async def _read_order_authoritative(
     return None, last
 
 
+def _record_leg_result(store: Optional[OrderStore], leg: LegExecutionResult) -> None:
+    """Updates the store row for `leg` (a no-op if store is None or the leg
+    was never assigned a client_order_id) with whatever leg.order_result /
+    leg.terminal_verified currently hold — called at every exit point of
+    _reconcile_final_states' per-leg loop, so a rejection, an unverifiable
+    read, and a clean terminal state are all reflected, not just the
+    happy path."""
+    if store is None or not leg.client_order_id:
+        return
+    r = leg.order_result
+    store.record_result(
+        leg.client_order_id,
+        order_id=r.order_id if r is not None else None,
+        status=r.status.value if r is not None else "not_submitted",
+        filled_size=r.filled_size if r is not None else Decimal(0),
+        remaining_size=r.remaining_size if r is not None else Decimal(0),
+        average_fill_price=r.average_fill_price if r is not None else None,
+        average_fee_paid=r.average_fee_paid if r is not None else None,
+        terminal_verified=leg.terminal_verified,
+    )
+
+
 async def _reconcile_final_states(
     client: KalshiClient,
     leg_results: list[LegExecutionResult],
+    store: Optional[OrderStore] = None,
 ) -> None:
     """Replace placement snapshots with authoritative terminal states.
 
@@ -416,10 +526,14 @@ async def _reconcile_final_states(
     intentional defense in depth. If the exchange ever reports a live
     remainder, cancel it and read once more so exposure is calculated from
     the post-cancel state rather than a stale placement response.
+
+    If `store` is given, every leg's store row is updated to match the
+    outcome reached here — see _record_leg_result.
     """
     for leg in leg_results:
         placed = leg.order_result
         if placed is None or not placed.order_id or placed.status == OrderStatus.REJECTED:
+            _record_leg_result(store, leg)
             continue
         final, read_error = await _read_order_authoritative(
             client, placed.order_id, placed.client_order_id
@@ -427,6 +541,7 @@ async def _reconcile_final_states(
         if final is None:
             leg.error = f"unable to verify final order state: {read_error}"
             leg.terminal_verified = False
+            _record_leg_result(store, leg)
             continue
 
         if final.remaining_size > 0:
@@ -456,6 +571,7 @@ async def _reconcile_final_states(
         if final.average_fee_paid is None:
             final.average_fee_paid = placed.average_fee_paid
         leg.order_result = final
+        _record_leg_result(store, leg)
 
 
 async def _confirm_unwind(demo_client: KalshiClient, unwind_results: list[LegExecutionResult]) -> bool:
@@ -502,30 +618,53 @@ async def _confirm_unwind(demo_client: KalshiClient, unwind_results: list[LegExe
     )
 
 
-async def execute_opportunity(demo_client: KalshiClient, opportunity: BasketOpportunity) -> AtomicExecutionResult:
+async def execute_opportunity(
+    demo_client: KalshiClient,
+    opportunity: BasketOpportunity,
+    *,
+    allow_no_direction: bool = False,
+    store: Optional[OrderStore] = None,
+) -> AtomicExecutionResult:
     """Places every leg of `opportunity` in one batched BUY call, cancels
     any unfilled remainder immediately, and — if the legs filled unevenly
     — fires an immediate offsetting SELL to bring the position back to a
     matched, risk-free basket (or fully flat), then polls to confirm that
     unwind actually completed. See module docstring.
 
-    Every leg is bought at its leg_quote.best_ask (the same price
-    scanner.basket used to compute the edge, so a fill — if the demo book
-    ever has a counterparty — would realize close to the priced edge), at
-    opportunity.max_size contracts each (equal quantity across the basket
-    — that's what makes the $1 payout/cost guarantee hold *if* every leg
-    actually fills to that size, which this function no longer just
-    assumes)."""
+    Every leg is bought at its direction-appropriate entry price (see
+    _entry_price — the same price scanner.basket used to compute the edge,
+    so a fill — if the book ever has a counterparty — would realize close
+    to the priced edge), at opportunity.max_size contracts each (equal
+    quantity across the basket — that's what makes the payout/cost
+    guarantee hold *if* every leg actually fills to that size, which this
+    function no longer just assumes).
+
+    allow_no_direction gates opportunity.direction == "buy_all_no" out
+    entirely (raises NoDirectionNotAllowedError) unless explicitly passed
+    True — see execution.allow_no_direction and this module's docstring.
+
+    store, if given (execution/store.py's OrderStore), is threaded into
+    every submission stage so each leg's row is written before it reaches
+    the exchange and updated in place once reconciled — additive on top of
+    data/orders.jsonl, never a replacement; see execution/store.py's
+    module docstring. Defaults to None (no persistence), the exact
+    behavior every existing caller/test already exercises."""
+    if opportunity.direction != "buy_basket" and not allow_no_direction:
+        raise NoDirectionNotAllowedError(
+            f"execution.allow_no_direction is False; refusing to submit a "
+            f"{opportunity.direction} basket for {opportunity.event_ticker}"
+        )
     decision_at_ms = int(time.time() * 1000)
     estimated_unwind_loss = estimate_worst_case_unwind_loss(opportunity) or Decimal(0)
+    position_side = _position_side(opportunity.direction)
     orders = [
         OrderRequest(
             market_id=leg.ticker,
-            side=Side.YES,
+            side=position_side,
             action=OrderAction.BUY,
             order_type=OrderType.LIMIT,
             size=opportunity.max_size,
-            limit_price=leg.best_ask,
+            limit_price=_entry_price(opportunity.direction, leg),
             client_order_id=_new_client_order_id("entry"),
             time_in_force=TimeInForce.FILL_OR_KILL,
         )
@@ -533,9 +672,9 @@ async def execute_opportunity(demo_client: KalshiClient, opportunity: BasketOppo
     ]
 
     entry_started_ms = int(time.time() * 1000)
-    leg_results = await _place_batch(demo_client, orders, OrderAction.BUY)
+    leg_results = await _place_batch(demo_client, orders, OrderAction.BUY, store=store, execution_stage="entry")
     entry_received_ms = int(time.time() * 1000)
-    await _reconcile_final_states(demo_client, leg_results)
+    await _reconcile_final_states(demo_client, leg_results, store=store)
 
     # An unverified leg's fill count is a guess. Deciding "no unwind needed"
     # from guesses is how an entry got reported clean while live buy orders
@@ -563,9 +702,9 @@ async def execute_opportunity(demo_client: KalshiClient, opportunity: BasketOppo
                 tickers=[l.ticker for l in salvage_legs],
                 reason="entry state partly unverified; flattening the legs whose fills are confirmed",
             )
-            observed_prices = {q.ticker: q.best_bid for q in opportunity.leg_quotes}
+            observed_prices = {q.ticker: _exit_price(opportunity.direction, q) for q in opportunity.leg_quotes}
             salvage_results = await _submit_unwind_stage(
-                demo_client, salvage_legs, observed_prices, "unwind-salvage",
+                demo_client, salvage_legs, observed_prices, "unwind-salvage", side=position_side, store=store,
             )
         raise UnresolvedSubmissionError(
             "entry left "
@@ -588,8 +727,10 @@ async def execute_opportunity(demo_client: KalshiClient, opportunity: BasketOppo
         )
 
     unwind_started_ms = int(time.time() * 1000)
-    observed_prices = {q.ticker: q.best_bid for q in opportunity.leg_quotes}
-    unwind_results = await _submit_unwind_stage(demo_client, unwind_legs, observed_prices, "unwind")
+    observed_prices = {q.ticker: _exit_price(opportunity.direction, q) for q in opportunity.leg_quotes}
+    unwind_results = await _submit_unwind_stage(
+        demo_client, unwind_legs, observed_prices, "unwind", side=position_side, store=store,
+    )
     unwind_attempt_count = 1
 
     remaining = _remaining_unwind_legs(unwind_legs, unwind_results)
@@ -598,14 +739,14 @@ async def execute_opportunity(demo_client: KalshiClient, opportunity: BasketOppo
         refreshed_prices: dict[str, Decimal] = {}
         for leg in remaining:
             try:
-                book = await demo_client.get_orderbook(leg.ticker, side=Side.YES, depth=_UNWIND_BOOK_DEPTH)
+                book = await demo_client.get_orderbook(leg.ticker, side=position_side, depth=_UNWIND_BOOK_DEPTH)
             except ExchangeError:
                 continue
             price = _price_for_bid_depth(book, leg.excess_size)
             if price is not None:
                 refreshed_prices[leg.ticker] = price
         refreshed_results = await _submit_unwind_stage(
-            demo_client, remaining, refreshed_prices, "unwind-refresh",
+            demo_client, remaining, refreshed_prices, "unwind-refresh", side=position_side, store=store,
         )
         if refreshed_results:
             unwind_attempt_count += 1
@@ -616,7 +757,7 @@ async def execute_opportunity(demo_client: KalshiClient, opportunity: BasketOppo
     if remaining:
         emergency_prices = {leg.ticker: _EMERGENCY_UNWIND_SELL_PRICE for leg in remaining}
         emergency_results = await _submit_unwind_stage(
-            demo_client, remaining, emergency_prices, "unwind-emergency",
+            demo_client, remaining, emergency_prices, "unwind-emergency", side=position_side, store=store,
         )
         unwind_attempt_count += 1
         unwind_results.extend(emergency_results)

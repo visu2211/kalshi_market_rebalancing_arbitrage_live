@@ -315,8 +315,9 @@ def _filled_trade_rows(records: list[dict]) -> list[dict]:
 
 def main() -> None:
     settings = load_settings()
+
     st.title("Kalshi Arbitrage Control Room")
-    st.caption("Read-only operational view · execution remains exclusively in scripts/run_scanner.py")
+    st.caption("Read-only · execution happens exclusively in `scripts/run_scanner.py`")
 
     header_left, header_mid, header_right = st.columns([2, 1, 1])
     with header_left:
@@ -330,77 +331,90 @@ def main() -> None:
         if st.button("Refresh dashboard", width="stretch"):
             st.rerun()
 
-    st.subheader("System status")
     status = _load_status(settings.logging.status_path)
-    if status is None:
-        st.warning("Scanner status is unavailable. Execution should be treated as offline.")
-        badge, age_s = "🔴 Offline", None
-    else:
-        updated_at = datetime.fromisoformat(status["updated_at"])
-        age_s = (datetime.now(timezone.utc) - updated_at).total_seconds()
-        rescan_interval_s = status.get("rescan_interval_s", settings.scanner.rescan_interval_s)
-        if age_s < 20:
-            badge = "🟢 Live"
-        elif age_s < rescan_interval_s * 2:
-            badge = "🟡 Stale"
+    with st.container(border=True):
+        if status is None:
+            st.markdown("#### 🔴 Offline")
+            st.caption("Scanner status is unavailable — execution should be treated as offline.")
+            age_s = None
         else:
-            badge = "🔴 Offline"
+            updated_at = datetime.fromisoformat(status["updated_at"])
+            age_s = (datetime.now(timezone.utc) - updated_at).total_seconds()
+            rescan_interval_s = status.get("rescan_interval_s", settings.scanner.rescan_interval_s)
+            if age_s < 20:
+                badge = "🟢 Live"
+            elif age_s < rescan_interval_s * 2:
+                badge = "🟡 Stale"
+            else:
+                badge = "🔴 Offline"
 
-        if status.get("circuit_breaker_tripped"):
-            st.error(f"Circuit breaker tripped: {status.get('circuit_breaker_reason', 'No reason recorded')}", icon="🛑")
+            risk = status.get("risk") or {}
+            # getattr keeps Streamlit hot reload compatible with a process that
+            # imported the older ExecutionSettings shape before `target` existed.
+            execution_target = status.get("execution_target") or getattr(settings.execution, "target", "demo")
+            target_label = "PROD · REAL MONEY" if execution_target == "prod" else "Demo"
 
-        position_mismatches = status.get("position_reconciliation_mismatches") or {}
-        if position_mismatches:
-            st.error(
-                "Position reconciliation mismatch: "
-                + ", ".join(f"{t} (believed {m['believed']}, actual {m['actual']})" for t, m in position_mismatches.items()),
-                icon="⚠️",
+            sc1, sc2, sc3, sc4, sc5, sc6 = st.columns(6)
+            sc1.metric("Status", badge, help=f"Updated {age_s:.0f}s ago")
+            sc2.metric("Account", target_label)
+            sc3.metric("WS events", status.get("ws_shortlist_events", "—"))
+            sc4.metric("Open signals", status.get("open_opportunities", 0))
+            sc5.metric("Gross exposure", f"${Decimal(str(risk.get('gross_exposure_usd', 0))):.2f}")
+            sc6.metric("Daily loss", f"${Decimal(str(risk.get('daily_realized_loss_usd', 0))):.2f}")
+
+            st.caption(
+                f"{status.get('phase', 'unknown')} · "
+                f"WS {'connected' if status.get('ws_connected') else 'disconnected'} · "
+                f"execution {'armed' if status.get('execution_enabled') else 'disabled'} · "
+                f"attempts {risk.get('daily_basket_attempts', 0)}/{risk.get('max_baskets_per_day', '—')} today"
             )
 
-        risk = status.get("risk") or {}
-        # getattr keeps Streamlit hot reload compatible with a process that
-        # imported the older ExecutionSettings shape before `target` existed.
-        execution_target = status.get("execution_target") or getattr(settings.execution, "target", "demo")
-        target_label = "PROD · REAL MONEY" if execution_target == "prod" else "Demo"
-        sc1, sc2, sc3, sc4, sc5, sc6 = st.columns(6)
-        sc1.metric("Status", badge)
-        sc2.metric("Account", target_label)
-        sc3.metric("WS events", status.get("ws_shortlist_events", "—"))
-        sc4.metric("Open signals", status.get("open_opportunities", 0))
-        sc5.metric("Gross exposure", f"${Decimal(str(risk.get('gross_exposure_usd', 0))):.2f}")
-        sc6.metric("Daily loss", f"${Decimal(str(risk.get('daily_realized_loss_usd', 0))):.2f}")
-        st.caption(
-            f"{status.get('phase', 'unknown')} · WS {'connected' if status.get('ws_connected') else 'disconnected'} · "
-            f"execution {'armed' if status.get('execution_enabled') else 'disabled'} · "
-            f"daily notional reserve ${Decimal(str(risk.get('daily_notional_usd', 0))):.2f} · "
-            f"attempts {risk.get('daily_basket_attempts', 0)}/{risk.get('max_baskets_per_day', '—')} daily, "
-            f"{risk.get('session_basket_attempts', 0)}/{risk.get('max_baskets_per_session', '—')} session · "
-            f"updated {age_s:.0f}s ago"
-        )
+            if status.get("circuit_breaker_tripped"):
+                st.error(f"Circuit breaker tripped: {status.get('circuit_breaker_reason', 'No reason recorded')}", icon="🛑")
+
+            position_mismatches = status.get("position_reconciliation_mismatches") or {}
+            if position_mismatches:
+                st.error(
+                    "Position reconciliation mismatch: "
+                    + ", ".join(f"{t} (believed {m['believed']}, actual {m['actual']})" for t, m in position_mismatches.items()),
+                    icon="⚠️",
+                )
+
+            with st.expander("Risk budget detail"):
+                st.caption(
+                    f"Daily notional reserve ${Decimal(str(risk.get('daily_notional_usd', 0))):.2f} · "
+                    f"attempts {risk.get('daily_basket_attempts', 0)}/{risk.get('max_baskets_per_day', '—')} daily, "
+                    f"{risk.get('session_basket_attempts', 0)}/{risk.get('max_baskets_per_session', '—')} session"
+                )
 
     opp_records = _load_jsonl(settings.logging.opportunities_log_path)
     order_records = _load_jsonl(settings.execution.orders_log_path)
     total_order_legs = sum(len(r.get("legs", [])) for r in order_records)
     filled_rows = _filled_trade_rows(order_records)
 
+    st.write("")
     trades_tab, signals_tab, snapshot_tab, diagnostics_tab = st.tabs(
-        ["Executed trades", "Detected opportunities", "Market snapshot", "Diagnostics"]
+        ["📈  Executed trades", "🔍  Detected opportunities", "🧪  Market snapshot", "🛠️  Diagnostics"]
     )
 
     with trades_tab:
         st.subheader("Trades sent to Kalshi")
         st.caption(
-            "Expected profit applies only to the equal quantity filled across every basket leg. "
-            "Partial/unwound rows can still realize an unwind loss. Click Market to open the contract on Kalshi; "
-            "use the order ID to locate the exact private order in your portfolio history."
+            "Expected profit applies only to the quantity matched across every leg — "
+            "partial/unwound rows can still realize an unwind loss.",
+            help=(
+                "Click Market to open the contract on Kalshi; use the order ID to locate the "
+                "exact private order in your portfolio history."
+            ),
         )
         if filled_rows:
             prod_rows = [row for row in filled_rows if row["target"] == "prod"]
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Completed baskets", len(filled_rows))
-            c2.metric("Real-money baskets", len(prod_rows))
-            c3.metric("Matched contracts", f"{sum(row['filled_size'] for row in filled_rows):.2f}")
-            c4.metric("Expected settlement profit", f"${sum(row['expected_profit_usd'] or 0 for row in filled_rows):.2f}")
+            with st.container(border=True):
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Completed baskets", len(filled_rows))
+                c2.metric("Real-money baskets", len(prod_rows))
+                c3.metric("Matched contracts", f"{sum(row['filled_size'] for row in filled_rows):.2f}")
+                c4.metric("Expected settlement profit", f"${sum(row['expected_profit_usd'] or 0 for row in filled_rows):.2f}")
             st.dataframe(
                 pd.DataFrame(filled_rows).sort_values("placed_at", ascending=False),
                 width="stretch", hide_index=True,
@@ -457,11 +471,8 @@ def main() -> None:
                 },
             )
 
+            st.write("")
             st.markdown("##### Price per leg")
-            st.caption(
-                "The basket price is the sum of every leg's ask plus Kalshi's fee on each. "
-                "Pick a detection to see which leg carried the edge and how much depth backed it."
-            )
             labelled = sorted(
                 enumerate(opp_records),
                 key=lambda pair: pair[1].get("detected_at") or "",
@@ -472,34 +483,38 @@ def main() -> None:
                 f"edge ${Decimal(str(r.get('edge_usd', 0))):.3f}"
                 for _, r in labelled
             ]
-            chosen = st.selectbox("Detection", options, index=0, key="opp_leg_pick")
+            chosen = st.selectbox(
+                "Detection", options, index=0, key="opp_leg_pick",
+                help="The basket price is the sum of every leg's ask plus Kalshi's fee on each.",
+            )
             selected = labelled[options.index(chosen)][1]
             leg_rows = _opportunity_leg_rows(selected)
-            if leg_rows:
-                st.dataframe(
-                    pd.DataFrame(leg_rows), width="stretch", hide_index=True,
-                    column_config={
-                        "ticker": "Leg",
-                        "ask": st.column_config.NumberColumn("Ask (you pay)", format="$%.4f"),
-                        "ask_size": st.column_config.NumberColumn("Ask size", format="%.2f"),
-                        "bid": st.column_config.NumberColumn("Bid (exit)", format="$%.4f"),
-                        "bid_size": st.column_config.NumberColumn("Bid size", format="%.2f"),
-                        "spread": st.column_config.NumberColumn("Spread", format="$%.4f"),
-                        "market_url": st.column_config.LinkColumn("Market", display_text="open"),
-                    },
-                )
-                sum_ask = sum(Decimal(str(q["ask"])) for q in leg_rows)
-                fees = Decimal(str(selected.get("fees_usd", 0)))
-                st.caption(
-                    f"sum of asks ${sum_ask:.4f} + fees ${fees:.4f} = "
-                    f"${sum_ask + fees:.4f} basket cost, against a $1.00 payout "
-                    f"→ edge ${Decimal(1) - sum_ask - fees:.4f} per contract"
-                )
-            else:
-                st.info(
-                    "This detection predates per-leg quote logging. Newer detections show "
-                    "each leg's ask, bid and depth here."
-                )
+            with st.container(border=True):
+                if leg_rows:
+                    st.dataframe(
+                        pd.DataFrame(leg_rows), width="stretch", hide_index=True,
+                        column_config={
+                            "ticker": "Leg",
+                            "ask": st.column_config.NumberColumn("Ask (you pay)", format="$%.4f"),
+                            "ask_size": st.column_config.NumberColumn("Ask size", format="%.2f"),
+                            "bid": st.column_config.NumberColumn("Bid (exit)", format="$%.4f"),
+                            "bid_size": st.column_config.NumberColumn("Bid size", format="%.2f"),
+                            "spread": st.column_config.NumberColumn("Spread", format="$%.4f"),
+                            "market_url": st.column_config.LinkColumn("Market", display_text="open"),
+                        },
+                    )
+                    sum_ask = sum(Decimal(str(q["ask"])) for q in leg_rows)
+                    fees = Decimal(str(selected.get("fees_usd", 0)))
+                    st.caption(
+                        f"sum of asks ${sum_ask:.4f} + fees ${fees:.4f} = "
+                        f"${sum_ask + fees:.4f} basket cost, against a $1.00 payout "
+                        f"→ edge ${Decimal(1) - sum_ask - fees:.4f} per contract"
+                    )
+                else:
+                    st.info(
+                        "This detection predates per-leg quote logging. Newer detections show "
+                        "each leg's ask, bid and depth here."
+                    )
         else:
             st.info("No opportunities recorded.")
 
@@ -521,11 +536,12 @@ def main() -> None:
                 legs_by_event.setdefault(leg.event_ticker, []).append(leg)
             rows = _event_rows(active_candidates, legs_by_event, settings)
             opportunities = [row for row in rows if row["opportunity"] != "-"]
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Open events", total_open)
-            c2.metric("Eligible active events", len(active_candidates))
-            c3.metric("Snapshot opportunities", len(opportunities))
-            st.caption(f"Snapshot taken {st.session_state.last_refreshed.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+            with st.container(border=True):
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Open events", total_open)
+                c2.metric("Eligible active events", len(active_candidates))
+                c3.metric("Snapshot opportunities", len(opportunities))
+                st.caption(f"Snapshot taken {st.session_state.last_refreshed.strftime('%Y-%m-%d %H:%M:%S')} UTC")
             if rows:
                 st.dataframe(
                     pd.DataFrame(rows).sort_values("buy_cost_usd", na_position="last"),
@@ -544,20 +560,23 @@ def main() -> None:
         st.subheader("Scanner diagnostics")
         if status is not None:
             diagnostics = status.get("detection_diagnostics") or {}
-            d1, d2, d3, d4 = st.columns(4)
-            d1.metric("Fully priced evaluations", diagnostics.get("fully_priced_evaluations", 0))
-            d2.metric("Rejected on price", diagnostics.get("price_threshold_rejections", 0))
-            d3.metric("Rejected as stale", diagnostics.get("stale_book_rejections", 0))
-            d4.metric("Active events omitted", status.get("active_events_omitted_from_ws", 0))
-            st.caption(
-                f"Incomplete books: {diagnostics.get('incomplete_book_rejections', 0)} · "
-                f"insufficient depth: {diagnostics.get('insufficient_depth_rejections', 0)} · "
-                f"incoherent books: {diagnostics.get('incoherent_book_rejections', 0)} · "
-                f"active legs {status.get('ws_shortlist_legs', 0)}/{status.get('active_legs_total', '—')} subscribed"
-            )
+            with st.container(border=True):
+                d1, d2, d3, d4 = st.columns(4)
+                d1.metric("Fully priced evaluations", diagnostics.get("fully_priced_evaluations", 0))
+                d2.metric("Rejected on price", diagnostics.get("price_threshold_rejections", 0))
+                d3.metric("Rejected as stale", diagnostics.get("stale_book_rejections", 0))
+                d4.metric("Active events omitted", status.get("active_events_omitted_from_ws", 0))
+                st.caption(
+                    f"Incomplete books: {diagnostics.get('incomplete_book_rejections', 0)} · "
+                    f"insufficient depth: {diagnostics.get('insufficient_depth_rejections', 0)} · "
+                    f"incoherent books: {diagnostics.get('incoherent_book_rejections', 0)} · "
+                    f"active legs {status.get('ws_shortlist_legs', 0)}/{status.get('active_legs_total', '—')} subscribed"
+                )
             closest = diagnostics.get("closest_baskets") or []
             if closest:
-                st.markdown("**Closest baskets observed this connection (fees included)**")
+                st.write("")
+                st.markdown("##### Closest baskets this connection")
+                st.caption("Fees included — sorted by however the scanner last wrote them.")
                 st.dataframe(
                     pd.DataFrame(closest), width="stretch", hide_index=True,
                     column_config={
@@ -570,12 +589,13 @@ def main() -> None:
                 )
             watched = status.get("watched_events", [])
             if watched:
-                st.markdown(f"**WebSocket subscriptions ({len(watched)} events)**")
+                st.write("")
+                st.markdown(f"##### WebSocket subscriptions ({len(watched)} events)")
                 st.dataframe(pd.DataFrame(watched).sort_values("volume_24h", ascending=False), width="stretch", hide_index=True)
+            st.write("")
             with st.expander("Raw scanner status"):
                 st.json(status)
-        st.caption(f"Opportunity log: {settings.logging.opportunities_log_path}")
-        st.caption(f"Order log: {settings.execution.orders_log_path}")
+        st.caption(f"Opportunity log: `{settings.logging.opportunities_log_path}`  ·  Order log: `{settings.execution.orders_log_path}`")
 
     if auto_refresh_live_views:
         time.sleep(5)
