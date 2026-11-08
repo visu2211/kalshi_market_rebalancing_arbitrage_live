@@ -893,31 +893,58 @@ async def _confirm_opportunity_via_rest(
         )
         return None
 
-    confirm_size = min(settings.execution.max_order_size_contracts, min(leg.ask_size for leg in legs))
-    confirmed = compute_opportunity(
-        event_ticker=opportunity.event_ticker,
-        legs=legs,
-        buy_basket_max_cost_usd=settings.arb.buy_basket_max_cost_usd,
-        min_depth_contracts=settings.scanner.min_depth_contracts,
-        contract_count=confirm_size,
-        fee_multiplier=opportunity.fee_multiplier,
-    )
+    # Direction-aware confirmation: buy_basket entries price off YES asks
+    # (leg.best_ask, min leg.ask_size); buy_all_no entries price off NO asks
+    # synthesized as (1 - leg.best_bid) consuming leg.bid_size — the same
+    # dispatch scanner/basket.py already makes between compute_opportunity and
+    # compute_no_opportunity. Validating a buy_all_no detection with the
+    # buy_basket math measured the wrong trade entirely and refused every
+    # detection as "edge gone" with sum_ask ~= $1.02 (observed 2026-11-08).
+    if opportunity.direction == "buy_all_no":
+        confirm_size = min(settings.execution.max_order_size_contracts, min(leg.bid_size for leg in legs))
+        confirmed = compute_no_opportunity(
+            event_ticker=opportunity.event_ticker,
+            legs=legs,
+            min_edge_usd=settings.arb.buy_all_no_min_edge_usd,
+            min_depth_contracts=settings.scanner.min_depth_contracts,
+            contract_count=confirm_size,
+            fee_multiplier=opportunity.fee_multiplier,
+        )
+    else:
+        confirm_size = min(settings.execution.max_order_size_contracts, min(leg.ask_size for leg in legs))
+        confirmed = compute_opportunity(
+            event_ticker=opportunity.event_ticker,
+            legs=legs,
+            buy_basket_max_cost_usd=settings.arb.buy_basket_max_cost_usd,
+            min_depth_contracts=settings.scanner.min_depth_contracts,
+            contract_count=confirm_size,
+            fee_multiplier=opportunity.fee_multiplier,
+        )
     if confirmed is None:
         # Both prices fee-inclusive so they are directly comparable. Logging a
         # fee-inclusive WS price against a raw REST ask sum made a basket that
         # got CHEAPER on REST read as though the edge had evaporated.
-        rest_sum_ask = sum((leg.best_ask for leg in legs), start=Decimal(0))
+        if opportunity.direction == "buy_all_no":
+            rest_entry_prices = [Decimal(1) - leg.best_bid for leg in legs]
+        else:
+            rest_entry_prices = [leg.best_ask for leg in legs]
+        rest_sum_ask = sum(rest_entry_prices, start=Decimal(0))
         rest_fees = sum(
-            (taker_fee(leg.best_ask, confirm_size, opportunity.fee_multiplier) for leg in legs),
+            (taker_fee(p, confirm_size, opportunity.fee_multiplier) for p in rest_entry_prices),
             start=Decimal(0),
         )
         logger.warning(
             "rest_confirmation_edge_gone", event_ticker=opportunity.event_ticker,
+            direction=opportunity.direction,
             ws_basket_price_usd=str(opportunity.basket_price_usd),
             rest_basket_price_usd=str(rest_sum_ask + rest_fees),
             rest_sum_ask_usd=str(rest_sum_ask),
             rest_fees_usd=str(rest_fees),
-            threshold_usd=str(settings.arb.buy_basket_max_cost_usd),
+            threshold_usd=str(
+                Decimal(len(legs) - 1) - settings.arb.buy_all_no_min_edge_usd
+                if opportunity.direction == "buy_all_no"
+                else settings.arb.buy_basket_max_cost_usd
+            ),
         )
         return None
 
