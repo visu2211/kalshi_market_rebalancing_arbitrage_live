@@ -49,6 +49,7 @@ class ScannerSettings:
 @dataclass(frozen=True)
 class ArbSettings:
     buy_basket_max_cost_usd: Decimal
+    buy_all_no_min_edge_usd: Decimal   # minimum required (N-1 - cost) edge for a buy_all_no basket — see scanner/basket.py's compute_no_opportunity. Default 0.02, symmetric with 1 - buy_basket_max_cost_usd
 
 
 @dataclass(frozen=True)
@@ -299,6 +300,7 @@ def load_settings(path: Path = DEFAULT_SETTINGS_PATH) -> Settings:
         ),
         arb=ArbSettings(
             buy_basket_max_cost_usd=_decimal(_required(arb_raw, "buy_basket_max_cost_usd", "arb"), "arb.buy_basket_max_cost_usd", strictly_positive=True, maximum="1"),
+            buy_all_no_min_edge_usd=_decimal(arb_raw.get("buy_all_no_min_edge_usd", "0.02"), "arb.buy_all_no_min_edge_usd", strictly_positive=True),
         ),
         relationships=RelationshipsSettings(
             trust_auto_detected=trust_auto_detected,

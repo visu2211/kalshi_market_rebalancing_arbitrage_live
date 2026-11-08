@@ -75,12 +75,13 @@ from execution.executor import (
     LegExecutionResult,
     execute_opportunity,
     estimate_worst_case_unwind_loss,
+    _exit_price,
 )
 from execution.risk import RiskState, RiskStateError
 from execution.store import OrderStore
 from kalshi.client import ExchangeError, KalshiClient, OrderbookLevel, OrderStatus, Side
 from kalshi.ws_client import WS_RECONNECTED_MESSAGE_TYPE, KalshiWSClient
-from scanner.basket import BasketOpportunity, LegQuote, compute_opportunity, incoherent_legs
+from scanner.basket import BasketOpportunity, LegQuote, compute_no_opportunity, compute_opportunity, incoherent_legs
 from scanner.fees import taker_fee
 from scanner.filters import EventCandidate, filter_events, has_recent_activity, select_by_volume
 from scanner.relationships import Relationship, build_relationships
@@ -1007,7 +1008,8 @@ async def _reconcile_execution(
             continue
         cost = estimated_capital_required(candidate.opportunity)
         unwind_turnover = sum(
-            leg.best_bid * candidate.opportunity.max_size for leg in candidate.opportunity.leg_quotes
+            _exit_price(candidate.opportunity.direction, leg) * candidate.opportunity.max_size
+            for leg in candidate.opportunity.leg_quotes
         )
         projected_turnover = cost + unwind_turnover
         projected_event = risk_state.event_exposure_usd.get(candidate.event_ticker, Decimal(0)) + cost
@@ -1104,7 +1106,7 @@ async def _reconcile_execution(
 
         cost = estimated_capital_required(opportunity)
         worst_unwind_turnover = sum(
-            leg.best_bid * opportunity.max_size for leg in opportunity.leg_quotes
+            _exit_price(opportunity.direction, leg) * opportunity.max_size for leg in opportunity.leg_quotes
         )
 
         # The capital/exposure gates above ran on WS prices. Re-run them on the
@@ -1225,17 +1227,27 @@ async def _reprice_event(
     risk_state: RiskState,
     detection_diagnostics: dict[str, Any],
     store: Optional[OrderStore] = None,
+    open_no_opportunities: Optional[dict[str, BasketOpportunity]] = None,
+    executed_no_opportunities: Optional[set[str]] = None,
 ) -> None:
     """Dispatches to every relationship that owns `ticker` — see
     scanner/relationships.py: a ticker can belong to more than one
     relationship (today, always exactly one, since only auto-detected
     exhaustive-partition relationships exist, but the dispatch must not
-    assume that), so this re-prices each one rather than just the first."""
+    assume that), so this re-prices each one rather than just the first.
+
+    open_no_opportunities/executed_no_opportunities, if given, track
+    buy_all_no detections in a separate namespace from the buy_basket ones
+    in open_opportunities/executed_opportunities — a relationship's legs
+    can carry an open opportunity in each direction at once, independently
+    (see scanner/basket.py's compute_no_opportunity). None (the default)
+    means buy_all_no detection is off entirely for this call."""
     for relationship in relationships_by_ticker.get(ticker, []):
         await _reprice_relationship(
             relationship, books, relationship_by_event_ticker, settings, open_opportunities,
             executed_opportunities, execution_client, market_data_client, balance_cache,
             circuit_breaker, believed_positions, risk_state, detection_diagnostics, store,
+            open_no_opportunities, executed_no_opportunities,
         )
 
 
@@ -1254,6 +1266,8 @@ async def _reprice_relationship(
     risk_state: RiskState,
     detection_diagnostics: dict[str, Any],
     store: Optional[OrderStore] = None,
+    open_no_opportunities: Optional[dict[str, BasketOpportunity]] = None,
+    executed_no_opportunities: Optional[set[str]] = None,
 ) -> None:
     """Re-runs the basket edge calc for one relationship and logs an
     open/close transition if the opportunity state changed. A fresh
@@ -1261,7 +1275,13 @@ async def _reprice_relationship(
     (_reconcile_execution), if armed (settings.execution.enabled and
     execution_client provided). Formerly the single-candidate body of
     _reprice_event, extracted so that function can dispatch to every
-    relationship a changed ticker belongs to."""
+    relationship a changed ticker belongs to.
+
+    When open_no_opportunities is given (not None), also runs
+    compute_no_opportunity on the same legs and tracks it independently —
+    a relationship can have an open buy_basket opportunity, an open
+    buy_all_no opportunity, both, or neither at once; the two directions
+    price off opposite sides of the book and never conflict."""
     candidate = relationship
 
     legs: list[LegQuote] = []
@@ -1363,6 +1383,44 @@ async def _reprice_relationship(
         executed_opportunities.discard(candidate.event_ticker)
         logger.info("opportunity_closed", event_ticker=candidate.event_ticker)
 
+    if open_no_opportunities is not None:
+        no_opportunity = compute_no_opportunity(
+            event_ticker=candidate.event_ticker,
+            legs=legs,
+            min_edge_usd=settings.arb.buy_all_no_min_edge_usd,
+            min_depth_contracts=settings.scanner.min_depth_contracts,
+            contract_count=contract_count,
+            fee_multiplier=candidate.fee_multiplier,
+        )
+        was_no_open = candidate.event_ticker in open_no_opportunities
+        if no_opportunity is not None:
+            open_no_opportunities[candidate.event_ticker] = no_opportunity
+            if not was_no_open:
+                logger.info(
+                    "opportunity_detected",
+                    stage="stage3",
+                    event_ticker=no_opportunity.event_ticker,
+                    direction=no_opportunity.direction,
+                    legs=no_opportunity.legs,
+                    basket_price_usd=str(no_opportunity.basket_price_usd),
+                    edge_usd=str(no_opportunity.edge_usd),
+                    max_size=str(no_opportunity.max_size),
+                )
+                _append_opportunity_jsonl(no_opportunity, settings.logging.opportunities_log_path)
+                if store is not None:
+                    store.record_opportunity(no_opportunity)
+            if settings.execution.enabled and execution_client is not None and executed_no_opportunities is not None:
+                await _reconcile_execution(
+                    open_no_opportunities, executed_no_opportunities, relationship_by_event_ticker, execution_client,
+                    market_data_client, settings, balance_cache, circuit_breaker, believed_positions,
+                    risk_state, store,
+                )
+        elif was_no_open:
+            del open_no_opportunities[candidate.event_ticker]
+            if executed_no_opportunities is not None:
+                executed_no_opportunities.discard(candidate.event_ticker)
+            logger.info("opportunity_closed", event_ticker=candidate.event_ticker)
+
 
 _POSITION_RECONCILE_INTERVAL_S = 30   # throttled well below the 5s heartbeat — positions only change when we execute, this is a safety check, not a hot path
 _STAGE1_MIN_BACKOFF_S = 5             # first retry delay after a failed Stage 1 REST pass; doubles up to scanner.rescan_interval_s
@@ -1404,6 +1462,8 @@ async def _stream_shortlist(
     relationship_by_event_ticker: dict[str, Relationship] = {r.event_ticker: r for r in relationships}
     open_opportunities: dict[str, BasketOpportunity] = {}
     executed_opportunities: set[str] = set()
+    open_no_opportunities: dict[str, BasketOpportunity] = {}
+    executed_no_opportunities: set[str] = set()
     balance_cache = _BalanceCache()
     last_heartbeat = 0.0
     last_reconciled = 0.0
@@ -1429,6 +1489,7 @@ async def _stream_shortlist(
             for book in books.values():
                 book.invalidate()
             open_opportunities.clear()
+            open_no_opportunities.clear()
             logger.info("ws_books_invalidated", reason="reconnected", tickers=len(books))
             continue
 
@@ -1438,7 +1499,7 @@ async def _stream_shortlist(
                 ticker, books, relationships_by_ticker, relationship_by_event_ticker, settings,
                 open_opportunities, executed_opportunities, execution_client, market_data_client,
                 balance_cache, circuit_breaker, believed_positions, risk_state, detection_diagnostics,
-                store,
+                store, open_no_opportunities, executed_no_opportunities,
             )
 
         now = time.monotonic()
@@ -1453,6 +1514,11 @@ async def _stream_shortlist(
                 # between its own ticks.
                 await _reconcile_execution(
                     open_opportunities, executed_opportunities, relationship_by_event_ticker, execution_client,
+                    market_data_client, settings, balance_cache, circuit_breaker, believed_positions,
+                    risk_state, store,
+                )
+                await _reconcile_execution(
+                    open_no_opportunities, executed_no_opportunities, relationship_by_event_ticker, execution_client,
                     market_data_client, settings, balance_cache, circuit_breaker, believed_positions,
                     risk_state, store,
                 )
@@ -1506,6 +1572,8 @@ async def _stream_shortlist(
                     "ws_connected": True,
                     "open_opportunities": len(open_opportunities),
                     "pending_execution": len(open_opportunities) - len(executed_opportunities),
+                    "open_no_opportunities": len(open_no_opportunities),
+                    "pending_no_execution": len(open_no_opportunities) - len(executed_no_opportunities),
                     "circuit_breaker_tripped": circuit_breaker.tripped,
                     "circuit_breaker_reason": circuit_breaker.tripped_reason,
                     "position_reconciliation_mismatches": {

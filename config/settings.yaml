@@ -31,8 +31,8 @@ logging:
   status_path: "data/scanner_status.json"              # overwritten each cycle/heartbeat — what stream/monitor.py is currently watching; read by ui/app.py
 
 execution:
-  enabled: true                                                 # ARMED 2026-08-28 for demo-account execution — target below is still "demo" (paper money)
-  target: "prod"                                                # "demo" (paper money) or "prod" (REAL MONEY, real Kalshi account — see execution/executor.py's module docstring before ever setting this to prod)
+  enabled: true                                                 # ARMED for demo-account execution — target below is "demo" (paper money)
+  target: "demo"                                                # "demo" (paper money) or "prod" (REAL MONEY, real Kalshi account — see execution/executor.py's module docstring before ever setting this to prod)
   demo_base_url: "https://external-api.demo.kalshi.co/trade-api/v2" # separate account/book from kalshi.base_url above — see execution/executor.py
   orders_log_path: "data/orders.jsonl"                          # append-only, one JSON line per leg order attempt ("kind": "basket" or "unwind")
   risk_state_path: "data/risk_state.json"                       # durable breaker, exposure, and bot-owned position/order state
@@ -40,7 +40,7 @@ execution:
   max_order_size_contracts: 1                                   # caps every leg's requested size regardless of the opportunity's computed max_size — deliberately small (2026-08-26: first-ever real-money capability, ramp up from here manually, not automatically)
   require_rest_confirmation: true                               # DEMO-ONLY OPT-OUT (2026-08-28). Normally true: re-read every leg from Kalshi's own book and submit off those prices. Set false here because 13 of 13 detections were refused by confirmation, so no order ever reached the exchange — and an edge lasting less than one round trip can never be corroborated by a second round trip, making the gate unable to distinguish "no edge" from "never tested". config/loader.py REFUSES to load with target: prod while this is false.
   prod_unconfirmed_orders_acknowledged: false                    # 2026-08-28: deliberate. REST confirmation refused 13/13 detections, so no order ever reached the exchange and the run could not distinguish "no edge" from "never tested". Submitting on WS prices to obtain one ground-truth fill. Bounded: 1 contract, 3 attempts, breaker trips on first mismatch, $23 account.
-  prod_enabled: true                                            # first production opt-in; production also requires account/env/webhook safeguards and CLI confirmation
+  prod_enabled: false                                           # off while target is "demo" — also means a future flip of target alone back to "prod" is not enough to arm real money; prod also requires account/env/webhook safeguards and CLI confirmation
   max_gross_exposure_usd: 25                                    # hard account-wide strategy exposure ceiling
   max_event_exposure_usd: 5                                     # hard exposure ceiling for a single event
   max_daily_notional_usd: 50                                    # conservative UTC-day turnover reserve: entry cost plus worst-case full unwind turnover
@@ -51,5 +51,6 @@ execution:
   max_baskets_per_day: 3                                        # durable UTC-day attempt ceiling across restarts
   event_cooldown_s: 86400                                       # durable no-retry window per exact event
   max_unwind_loss_usd: 0.25                                     # reject unless observed exit depth bounds a full partial-fill unwind to this loss. Raised from 0.10 on 2026-08-28: at max_order_size_contracts=1 Kalshi's per-order fee rounding alone costs 0.04-0.12 per basket, so 0.10 was unreachable — every live detection was refused (observed 0.11 and 0.15 estimates). Revisit alongside the size cap before prod; a larger size amortizes the rounding and lowers this estimate for the same basket.
+  allow_no_direction: true                                      # 2026-11-03: arms buy_all_no (Phase B) for the demo account, same risk gates as buy_basket (see execution/executor.py's NoDirectionNotAllowedError, scanner/basket.py's compute_no_opportunity)
   process_lock_path: "data/execution.lock"                      # prevents concurrent armed scanner processes
   alerts_log_path: "data/alerts.jsonl"                         # local incident stream; prod also requires Telegram or a generic webhook

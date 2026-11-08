@@ -1,3 +1,4 @@
+
 """Capital-aware execution ranking — when multiple detected opportunities
 are open at once and available demo-account capital can't fund all of
 them, decides which to execute and in what order.
