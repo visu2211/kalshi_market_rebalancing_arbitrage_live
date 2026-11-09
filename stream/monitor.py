@@ -514,7 +514,10 @@ async def _execute_and_log(
 
     try:
         result = await execute_opportunity(
-            execution_client, opportunity, allow_no_direction=settings.execution.allow_no_direction, store=store,
+            execution_client, opportunity,
+            allow_no_direction=settings.execution.allow_no_direction,
+            use_canary_submission=settings.execution.use_canary_submission,
+            store=store,
         )
     except UnresolvedSubmissionError as exc:
         # The true position at the exchange is unknown. Do not submit another

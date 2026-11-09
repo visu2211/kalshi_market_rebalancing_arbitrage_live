@@ -620,11 +620,26 @@ async def _confirm_unwind(demo_client: KalshiClient, unwind_results: list[LegExe
     )
 
 
+def _canary_leg_index(opportunity: BasketOpportunity) -> int:
+    """Pick the leg most likely to reject the FOK — the one with the LEAST
+    resting depth at the price we want to cross. For buy_basket we read
+    ask_size, for buy_all_no we read bid_size (the opposite side carries the
+    depth for the synthesized NO ask). Ties broken deterministically by
+    original index so tests are stable."""
+    quotes = opportunity.leg_quotes
+    if opportunity.direction == "buy_basket":
+        key = lambda i: (quotes[i].ask_size, i)
+    else:
+        key = lambda i: (quotes[i].bid_size, i)
+    return min(range(len(quotes)), key=key)
+
+
 async def execute_opportunity(
     demo_client: KalshiClient,
     opportunity: BasketOpportunity,
     *,
     allow_no_direction: bool = False,
+    use_canary_submission: bool = False,
     store: Optional[OrderStore] = None,
 ) -> AtomicExecutionResult:
     """Places every leg of `opportunity` in one batched BUY call, cancels
@@ -674,9 +689,75 @@ async def execute_opportunity(
     ]
 
     entry_started_ms = int(time.time() * 1000)
-    leg_results = await _place_batch(demo_client, orders, OrderAction.BUY, store=store, execution_stage="entry")
+    if use_canary_submission and len(orders) > 1:
+        # Canary-leg mode: submit the thinnest leg alone first. If it
+        # rejects (the most likely leg to reject, given it has the least
+        # resting depth), the basket is aborted at zero exposure. If it
+        # fills, only then do we fire the remaining legs. Cuts worst-case
+        # partial-fill naked exposure from (N-1) legs to 1 leg at the cost
+        # of one extra RTT; opt-in via execution.use_canary_submission.
+        canary_idx = _canary_leg_index(opportunity)
+        canary_order = orders[canary_idx]
+        rest_orders = [o for i, o in enumerate(orders) if i != canary_idx]
+        canary_result_list = await _place_batch(
+            demo_client, [canary_order], OrderAction.BUY, store=store, execution_stage="entry",
+        )
+        await _reconcile_final_states(demo_client, canary_result_list, store=store)
+        canary_result = canary_result_list[0]
+        canary_filled = (
+            canary_result.terminal_verified
+            and canary_result.order_result is not None
+            and canary_result.order_result.filled_size >= canary_order.size
+        )
+        if canary_filled:
+            logger.info(
+                "canary_filled_firing_rest",
+                event_ticker=opportunity.event_ticker,
+                canary_ticker=canary_order.market_id,
+                rest=len(rest_orders),
+            )
+            rest_results = await _place_batch(
+                demo_client, rest_orders, OrderAction.BUY, store=store, execution_stage="entry",
+            )
+            await _reconcile_final_states(demo_client, rest_results, store=store)
+            # Preserve the original leg ordering for downstream reconciliation
+            leg_results = [None] * len(orders)  # type: ignore[list-item]
+            leg_results[canary_idx] = canary_result
+            rest_iter = iter(rest_results)
+            for i in range(len(orders)):
+                if i != canary_idx:
+                    leg_results[i] = next(rest_iter)
+        else:
+            logger.info(
+                "canary_rejected_aborting_basket",
+                event_ticker=opportunity.event_ticker,
+                canary_ticker=canary_order.market_id,
+                canary_error=canary_result.error,
+            )
+            # Synthesize no-fill rejection results for the legs we never
+            # fired. action/limit_price/size mirror what would have gone to
+            # the exchange so logging + bookkeeping reads the same shape as
+            # a batched all-rejected outcome.
+            synthetic_rest: list[LegExecutionResult] = [
+                LegExecutionResult(
+                    ticker=o.market_id, action=OrderAction.BUY, limit_price=o.limit_price,
+                    size=o.size, order_result=None,
+                    error="canary_leg_rejected: skipped — the thinnest leg's FOK rejected first",
+                    client_order_id=o.client_order_id or "",
+                    terminal_verified=True,
+                )
+                for o in rest_orders
+            ]
+            leg_results = [None] * len(orders)  # type: ignore[list-item]
+            leg_results[canary_idx] = canary_result
+            rest_iter = iter(synthetic_rest)
+            for i in range(len(orders)):
+                if i != canary_idx:
+                    leg_results[i] = next(rest_iter)
+    else:
+        leg_results = await _place_batch(demo_client, orders, OrderAction.BUY, store=store, execution_stage="entry")
+        await _reconcile_final_states(demo_client, leg_results, store=store)
     entry_received_ms = int(time.time() * 1000)
-    await _reconcile_final_states(demo_client, leg_results, store=store)
 
     # An unverified leg's fill count is a guess. Deciding "no unwind needed"
     # from guesses is how an entry got reported clean while live buy orders

@@ -94,6 +94,7 @@ class ExecutionSettings:
     max_unwind_loss_usd: Decimal
     min_edge_stability_ticks: int          # default 1 (no filter) — require the WS edge to persist this many consecutive ticks on the same event before it is executable. Filters flicker edges without adding a REST roundtrip.
     min_seconds_to_event_close: int        # default 0 (no filter) — reject candidates whose nearest leg close_time is within this many seconds. Prevents submitting into a market that already settled, where unwind cannot fill (Nov 4 incident).
+    use_canary_submission: bool            # default False (unchanged batched-FOK entry) — when True, execute_opportunity places the thinnest leg alone as a canary; if it fills, the rest are submitted in one batch, if it rejects the basket is aborted with zero naked exposure. Cuts partial-fill risk at the cost of one extra RTT.
     process_lock_path: Path
     alerts_log_path: Path
     alert_webhook_url: Optional[str]
@@ -345,6 +346,7 @@ def load_settings(path: Path = DEFAULT_SETTINGS_PATH) -> Settings:
             max_unwind_loss_usd=_decimal(_required(execution_raw, "max_unwind_loss_usd", "execution"), "execution.max_unwind_loss_usd", strictly_positive=True, maximum="1"),
             min_edge_stability_ticks=_int(execution_raw.get("min_edge_stability_ticks", 1), "execution.min_edge_stability_ticks", minimum=1),
             min_seconds_to_event_close=_int(execution_raw.get("min_seconds_to_event_close", 0), "execution.min_seconds_to_event_close", minimum=0),
+            use_canary_submission=_bool(execution_raw.get("use_canary_submission", False), "execution.use_canary_submission"),
             process_lock_path=process_lock_path,
             alerts_log_path=alerts_log_path,
             alert_webhook_url=alert_webhook_url,

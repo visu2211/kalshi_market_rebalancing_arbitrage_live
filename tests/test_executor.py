@@ -641,3 +641,58 @@ async def test_store_none_is_the_default_and_changes_nothing(buy_basket_opportun
     result = await execute_opportunity(client, buy_basket_opportunity)
     assert result.mismatched is False
     assert all(leg.client_order_id for leg in result.leg_results)   # populated regardless of store
+
+
+# ---- execute_opportunity: canary-leg submission ----
+
+@pytest.mark.asyncio
+async def test_canary_mode_submits_thinnest_leg_alone_first_then_the_rest(buy_basket_opportunity):
+    """HIKE25 has the smallest ask_size (45) in the buy_basket_opportunity
+    fixture — canary mode picks that leg as the probe. If it fills, the
+    other three fire in a second batch."""
+    client = FakeKalshiClient()
+    result = await execute_opportunity(client, buy_basket_opportunity, use_canary_submission=True)
+
+    # Two batched calls, not one.
+    assert len(client.batch_calls) == 2
+    first_batch = client.batch_calls[0]
+    assert [o.market_id for o in first_batch] == ["HIKE25"]
+    rest_batch = client.batch_calls[1]
+    assert [o.market_id for o in rest_batch] == ["CUT50", "CUT25", "NOCHG"]
+    # Original leg order is preserved in the returned results.
+    assert [lr.ticker for lr in result.leg_results] == ["CUT50", "CUT25", "NOCHG", "HIKE25"]
+    assert result.mismatched is False
+    assert result.unwind_confirmed is True
+
+
+@pytest.mark.asyncio
+async def test_canary_rejection_aborts_basket_without_firing_other_legs(buy_basket_opportunity):
+    """If the canary (thinnest leg) FOK-rejects, the batch is never fired for
+    the other legs and no naked exposure can exist. Every leg is reported
+    as a rejection shaped like an all-rejected batched outcome."""
+    client = FakeKalshiClient(reject_tickers=frozenset({"HIKE25"}))
+    result = await execute_opportunity(client, buy_basket_opportunity, use_canary_submission=True)
+
+    assert len(client.batch_calls) == 1   # only the canary fired
+    assert [o.market_id for o in client.batch_calls[0]] == ["HIKE25"]
+    # No unwind: nothing filled, nothing to flatten.
+    assert result.unwind_results == []
+    # All four legs are in the result in original order, canary carries its
+    # own rejection error, the synthetic ones carry the canary-aborted error.
+    by_ticker = {lr.ticker: lr for lr in result.leg_results}
+    assert by_ticker["HIKE25"].order_result is not None
+    assert by_ticker["HIKE25"].order_result.status == OrderStatus.REJECTED
+    for t in ("CUT50", "CUT25", "NOCHG"):
+        assert by_ticker[t].order_result is None
+        assert "canary_leg_rejected" in (by_ticker[t].error or "")
+
+
+@pytest.mark.asyncio
+async def test_canary_mode_off_preserves_single_batched_submission(buy_basket_opportunity):
+    """use_canary_submission default (and False) runs exactly the batched
+    path tested above — equivalence guard."""
+    client = FakeKalshiClient()
+    result = await execute_opportunity(client, buy_basket_opportunity)   # default False
+    assert len(client.batch_calls) == 1
+    assert [o.market_id for o in client.batch_calls[0]] == ["CUT50", "CUT25", "NOCHG", "HIKE25"]
+    assert result.mismatched is False
