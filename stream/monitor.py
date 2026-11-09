@@ -1045,12 +1045,20 @@ async def _reconcile_execution(
         if settings.execution.min_seconds_to_event_close > 0:
             seconds_to_close = (candidate.expected_settlement_time - utc_now).total_seconds()
             if seconds_to_close < settings.execution.min_seconds_to_event_close:
-                logger.info(
-                    "execution_skipped_too_close_to_settle",
-                    event_ticker=candidate.event_ticker,
-                    seconds_to_close=seconds_to_close,
-                    required=settings.execution.min_seconds_to_event_close,
-                )
+                # Monotonic: once we are past the cutoff, we are not coming
+                # back. Mark executed so this event is not reconsidered on
+                # every WS tick for the remainder of the run — otherwise
+                # dozens of these fire per second for a stale yesterday
+                # event whose book still gets updates. Logged once per
+                # session per event.
+                if candidate.event_ticker not in executed_opportunities:
+                    logger.info(
+                        "execution_skipped_too_close_to_settle",
+                        event_ticker=candidate.event_ticker,
+                        seconds_to_close=seconds_to_close,
+                        required=settings.execution.min_seconds_to_event_close,
+                    )
+                    executed_opportunities.add(candidate.event_ticker)
                 continue
         worst_unwind_loss = estimate_worst_case_unwind_loss(candidate.opportunity)
         if worst_unwind_loss is None:
