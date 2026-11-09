@@ -21,6 +21,17 @@ scanner:
   orderbook_depth: 5                    # book depth to request per leg in Stage 2's --once REST summary (only need top-of-book)
   max_ws_legs: 1000                     # normally covers the full active same-day universe; status reports events omitted if this ceiling is reached
   max_quote_age_ms: 300000              # ordered WS deltas keep unchanged books current; reconnect/gap invalidation and the 5-minute snapshot rebuild are the freshness boundaries
+  blacklisted_series:                   # 2026-11-09: Kalshi series this account is NOT onboarded on — order submissions on these return insufficient_shard_balance ("Exchange user not found"). Probed live 2026-11-09T06:45 via scripts/probe_shards.py against the demo account. Scanner filters these out at Stage 1 so no WS bandwidth / detection effort is spent on markets we structurally cannot trade. Re-probe by re-running the script when the account's shard coverage changes (adding / removing series).
+    - KXATPCHALLENGERMATCH
+    - KXATPDOUBLES
+    - KXATPEXACTMATCH
+    - KXATPMATCH
+    - KXATPSETWINNER
+    - KXITFMATCH
+    - KXITFWMATCH
+    - KXPHKLGAME
+    - KXWTAMATCH
+    - KXWTASETWINNER
 
 arb:
   buy_basket_max_cost_usd: 0.98         # sum(ask_i) + sum(fee_i) must be below this to flag a buy-basket opportunity — the only direction implemented, see scanner/basket.py

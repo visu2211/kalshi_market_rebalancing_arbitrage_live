@@ -1022,7 +1022,13 @@ async def _reconcile_execution(
             break
         last_attempt = risk_state.attempted_events_at.get(candidate.event_ticker)
         if last_attempt is not None and now_epoch - last_attempt < settings.execution.event_cooldown_s:
-            logger.warning("execution_skipped_event_cooldown", event_ticker=candidate.event_ticker)
+            # Durable per-event cooldown is monotonic (grows with every WS
+            # tick), so once rejected it stays rejected for this run. Mark
+            # consumed to avoid logging dozens of times per second while the
+            # book keeps ticking — same pattern as the close-time gate below.
+            if candidate.event_ticker not in executed_opportunities:
+                logger.warning("execution_skipped_event_cooldown", event_ticker=candidate.event_ticker)
+                executed_opportunities.add(candidate.event_ticker)
             continue
         # Edge-stability filter. The WS detection may be a one-tick flicker that
         # dies before any order could reach the exchange (see 2026-11-08 LocalBook
@@ -1786,6 +1792,7 @@ async def run_stage3(
             raw_events,
             min_outcome_legs=settings.scanner.min_outcome_legs,
             max_outcome_legs=settings.scanner.max_outcome_legs,
+            blacklisted_series=set(settings.scanner.blacklisted_series),
         )
         active_candidates = [c for c in candidates if has_recent_activity(c)]
         shortlist = select_by_volume(active_candidates, max_legs=settings.scanner.max_ws_legs)

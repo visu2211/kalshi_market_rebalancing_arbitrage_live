@@ -59,6 +59,23 @@ def test_drops_non_mutually_exclusive_event():
     assert filter_events(events, 2, 6, now=NOW) == []
 
 
+def test_drops_event_whose_series_is_blacklisted():
+    """A series whose shard the execution account is not onboarded on
+    (insufficient_shard_balance / "Exchange user not found") is excluded at
+    Stage 1 — no WS bandwidth, no detection effort, no doomed executions."""
+    events = [
+        _event("KXWTAMATCH-26NOV08TJELIN", True, [_market("A"), _market("B")], series_ticker="KXWTAMATCH"),
+        _event("KXNCAAMBGAME-26NOV08WICHUSC", True, [_market("C"), _market("D")], series_ticker="KXNCAAMBGAME"),
+    ]
+    out = filter_events(events, 2, 6, now=NOW, blacklisted_series={"KXWTAMATCH"})
+    assert [c.event_ticker for c in out] == ["KXNCAAMBGAME-26NOV08WICHUSC"]
+    # Empty/absent blacklist is behavior-identical to the prior call.
+    out2 = filter_events(events, 2, 6, now=NOW)
+    assert {c.event_ticker for c in out2} == {
+        "KXWTAMATCH-26NOV08TJELIN", "KXNCAAMBGAME-26NOV08WICHUSC",
+    }
+
+
 def test_drops_event_below_min_legs():
     events = [_event("KXONE-1", True, [_market("A")])]
     assert filter_events(events, 2, 6, now=NOW) == []

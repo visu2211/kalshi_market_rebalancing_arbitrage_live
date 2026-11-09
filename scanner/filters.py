@@ -92,16 +92,27 @@ def filter_events(
     min_outcome_legs: int,
     max_outcome_legs: int,
     now: Optional[datetime] = None,
+    blacklisted_series: Optional[set[str]] = None,
 ) -> list[EventCandidate]:
     """raw_events: the `events` list from GET /events?with_nested_markets=true.
     Keeps only events that are mutually exclusive, have leg count in
     [min_outcome_legs, max_outcome_legs], and settle by the end of the
-    current UTC calendar day (see module docstring)."""
+    current UTC calendar day (see module docstring).
+
+    blacklisted_series: optional set of Kalshi series_ticker values (e.g.
+    "KXWTAMATCH") the execution account is NOT onboarded on — rejecting here
+    avoids spending WS bandwidth, Stage 2 book reads, and worse, real
+    execution attempts, on events whose orders will come back with the
+    Kalshi `insufficient_shard_balance` ("Exchange user not found") error.
+    None means no filter, matching prior behavior."""
     now = now or datetime.now(timezone.utc)
     end_of_day = _end_of_day_utc(now)
+    blacklist = blacklisted_series or set()
 
     candidates: list[EventCandidate] = []
     for event in raw_events:
+        if event.get("series_ticker") in blacklist:
+            continue
         # MECNET is the only supported mutually-exclusive collateral
         # structure. It does not by itself prove collective exhaustiveness;
         # live execution intentionally accepts this residual semantic risk

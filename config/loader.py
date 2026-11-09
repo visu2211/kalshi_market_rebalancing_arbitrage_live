@@ -44,6 +44,7 @@ class ScannerSettings:
     orderbook_depth: int
     max_ws_legs: int
     max_quote_age_ms: int
+    blacklisted_series: frozenset[str]   # Kalshi series_ticker values the execution account is not onboarded on — filtered at Stage 1 (see scanner/filters.py). Empty by default (no filter), matching prior behavior.
 
 
 @dataclass(frozen=True)
@@ -299,6 +300,10 @@ def load_settings(path: Path = DEFAULT_SETTINGS_PATH) -> Settings:
             orderbook_depth=_int(_required(scanner_raw, "orderbook_depth", "scanner"), "scanner.orderbook_depth", minimum=1),
             max_ws_legs=_int(_required(scanner_raw, "max_ws_legs", "scanner"), "scanner.max_ws_legs", minimum=1),
             max_quote_age_ms=_int(_required(scanner_raw, "max_quote_age_ms", "scanner"), "scanner.max_quote_age_ms", minimum=1),
+            blacklisted_series=frozenset(
+                s for s in (scanner_raw.get("blacklisted_series") or [])
+                if isinstance(s, str) and s
+            ),
         ),
         arb=ArbSettings(
             buy_basket_max_cost_usd=_decimal(_required(arb_raw, "buy_basket_max_cost_usd", "arb"), "arb.buy_basket_max_cost_usd", strictly_positive=True, maximum="1"),

@@ -99,6 +99,7 @@ async def _run_scan(settings: Settings) -> tuple[int, list[EventCandidate], list
             raw_events,
             min_outcome_legs=settings.scanner.min_outcome_legs,
             max_outcome_legs=settings.scanner.max_outcome_legs,
+            blacklisted_series=set(settings.scanner.blacklisted_series),
         )
         active_candidates = [c for c in candidates if has_recent_activity(c)]
 
