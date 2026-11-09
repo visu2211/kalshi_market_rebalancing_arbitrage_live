@@ -294,3 +294,14 @@ def test_event_accepted_when_every_leg_has_a_settlement_timestamp():
     }
     result = filter_events([event], 2, 6, now=today)
     assert len(result) == 1 and result[0].event_ticker == "KXWHOLE"
+
+
+def test_drops_event_whose_settlement_has_already_passed():
+    """Kalshi sometimes leaves resolved events open with a future
+    expected_expiration_time and a past close_time. Require settlement to
+    be in the future (strictly), not just before end-of-day."""
+    past_expires = "2026-08-25T06:00:00Z"   # 6h before NOW (2026-08-25T12:00)
+    m1 = _market("A", expected_expiration_time=past_expires)
+    m2 = _market("B", expected_expiration_time=past_expires)
+    events = [_event("KXYESTERDAY-1", True, [m1, m2])]
+    assert filter_events(events, 2, 6, now=NOW) == []

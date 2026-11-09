@@ -158,6 +158,15 @@ def filter_events(
         expected_settlement_time = max(leg_settlement_times)
         if expected_settlement_time > end_of_day:
             continue
+        # Also reject events whose settlement is already in the past — Kalshi
+        # sometimes leaves yesterday's resolved events in the open set with
+        # future expected_expiration_time but a close_time already behind
+        # "now", and their stale books flicker synthetic edges the execute-
+        # time close-time filter caught (verified live 2026-11-09 on
+        # KXITFMATCH-26NOV08 and KXWTASETWINNER-26NOV08 events). Filter them
+        # at Stage 1 so no WS bandwidth or detection effort is spent.
+        if expected_settlement_time < now:
+            continue
 
         event_ticker = event.get("event_ticker")
         if not event_ticker:
