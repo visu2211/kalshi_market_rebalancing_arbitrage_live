@@ -91,6 +91,8 @@ class ExecutionSettings:
     max_baskets_per_day: int
     event_cooldown_s: int
     max_unwind_loss_usd: Decimal
+    min_edge_stability_ticks: int          # default 1 (no filter) — require the WS edge to persist this many consecutive ticks on the same event before it is executable. Filters flicker edges without adding a REST roundtrip.
+    min_seconds_to_event_close: int        # default 0 (no filter) — reject candidates whose nearest leg close_time is within this many seconds. Prevents submitting into a market that already settled, where unwind cannot fill (Nov 4 incident).
     process_lock_path: Path
     alerts_log_path: Path
     alert_webhook_url: Optional[str]
@@ -336,6 +338,8 @@ def load_settings(path: Path = DEFAULT_SETTINGS_PATH) -> Settings:
             max_baskets_per_day=_int(_required(execution_raw, "max_baskets_per_day", "execution"), "execution.max_baskets_per_day", minimum=1),
             event_cooldown_s=_int(_required(execution_raw, "event_cooldown_s", "execution"), "execution.event_cooldown_s", minimum=1),
             max_unwind_loss_usd=_decimal(_required(execution_raw, "max_unwind_loss_usd", "execution"), "execution.max_unwind_loss_usd", strictly_positive=True, maximum="1"),
+            min_edge_stability_ticks=_int(execution_raw.get("min_edge_stability_ticks", 1), "execution.min_edge_stability_ticks", minimum=1),
+            min_seconds_to_event_close=_int(execution_raw.get("min_seconds_to_event_close", 0), "execution.min_seconds_to_event_close", minimum=0),
             process_lock_path=process_lock_path,
             alerts_log_path=alerts_log_path,
             alert_webhook_url=alert_webhook_url,

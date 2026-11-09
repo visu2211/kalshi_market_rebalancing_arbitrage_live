@@ -837,3 +837,51 @@ async def test_reprice_event_records_detected_opportunities_to_the_store_when_gi
     assert len(recorded) == 1
     assert recorded[0].direction == "buy_basket"
     assert set(recorded[0].legs) == {"X", "Y"}
+
+
+@pytest.mark.asyncio
+async def test_edge_stability_counter_increments_each_tick_and_clears_on_close(tmp_path):
+    """Each WS tick that keeps the edge open increments the counter; once
+    the opportunity closes (edge dies), the counter is cleared so a new
+    open starts from 1 again. _reconcile_execution gates on this value to
+    filter one-tick flicker edges."""
+    settings = _stage1_settings(tmp_path)
+    r1 = Relationship(
+        event_ticker="EVT-R1", title="R1", leg_tickers=["X", "Y"],
+        leg_volume_24h={}, expected_settlement_time=datetime.now(timezone.utc),
+    )
+    relationships_by_ticker = {"X": [r1], "Y": [r1]}
+    relationship_by_event_ticker = {r1.event_ticker: r1}
+    books = {"X": _fresh_book(), "Y": _fresh_book()}
+    open_opportunities: dict = {}
+    detection_diagnostics = {
+        "fully_priced_evaluations": 0, "stale_book_rejections": 0, "incomplete_book_rejections": 0,
+        "incoherent_book_rejections": 0, "insufficient_depth_rejections": 0, "price_threshold_rejections": 0,
+        "closest_baskets": {},
+        "edge_stability_ticks": {"buy_basket": {}, "buy_all_no": {}},
+    }
+
+    async def rp():
+        await _reprice_event(
+            "X", books, relationships_by_ticker, relationship_by_event_ticker, settings,
+            open_opportunities, executed_opportunities=set(), execution_client=None, market_data_client=None,
+            balance_cache=_BalanceCache(), circuit_breaker=_CircuitBreaker(max_mismatches=1),
+            believed_positions={}, risk_state=RiskState.empty(datetime.now(timezone.utc)),
+            detection_diagnostics=detection_diagnostics,
+        )
+
+    await rp()
+    await rp()
+    await rp()
+    assert detection_diagnostics["edge_stability_ticks"]["buy_basket"]["EVT-R1"] == 3
+
+    # Collapse the book so no opportunity remains, then re-tick: counter clears.
+    books["X"] = _fresh_book(ask=Decimal("0.99"))
+    await rp()
+    assert "EVT-R1" not in detection_diagnostics["edge_stability_ticks"]["buy_basket"]
+    assert "EVT-R1" not in open_opportunities
+
+    # Restore and re-open: counter starts at 1 again, not continues from 3.
+    books["X"] = _fresh_book()
+    await rp()
+    assert detection_diagnostics["edge_stability_ticks"]["buy_basket"]["EVT-R1"] == 1

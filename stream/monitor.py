@@ -952,6 +952,7 @@ async def _confirm_opportunity_via_rest(
 
 
 async def _reconcile_execution(
+    edge_stability_ticks: dict[str, int],
     open_opportunities: dict[str, BasketOpportunity],
     executed_opportunities: set[str],
     relationship_by_event_ticker: dict[str, Relationship],
@@ -1023,6 +1024,34 @@ async def _reconcile_execution(
         if last_attempt is not None and now_epoch - last_attempt < settings.execution.event_cooldown_s:
             logger.warning("execution_skipped_event_cooldown", event_ticker=candidate.event_ticker)
             continue
+        # Edge-stability filter. The WS detection may be a one-tick flicker that
+        # dies before any order could reach the exchange (see 2026-11-08 LocalBook
+        # diagnostic: WS and REST books were byte-identical; the problem was
+        # edge lifetime < RTT). Require the edge to have persisted this many
+        # consecutive WS ticks on this event before it is executable. Default 1
+        # preserves prior behavior.
+        observed_ticks = edge_stability_ticks.get(candidate.event_ticker, 0)
+        if observed_ticks < settings.execution.min_edge_stability_ticks:
+            logger.info(
+                "execution_skipped_edge_unstable", event_ticker=candidate.event_ticker,
+                observed_ticks=observed_ticks, required=settings.execution.min_edge_stability_ticks,
+            )
+            continue
+        # Close-time cutoff. Nov 4 incident: a basket executed 6+ hours after
+        # the event had settled had leg BB reject FOK (nothing resting) while
+        # leg TL filled — and then no unwind could fill because the market was
+        # dead. Reject within min_seconds_to_event_close of settlement. Default
+        # 0 preserves prior behavior.
+        if settings.execution.min_seconds_to_event_close > 0:
+            seconds_to_close = (candidate.expected_settlement_time - utc_now).total_seconds()
+            if seconds_to_close < settings.execution.min_seconds_to_event_close:
+                logger.info(
+                    "execution_skipped_too_close_to_settle",
+                    event_ticker=candidate.event_ticker,
+                    seconds_to_close=seconds_to_close,
+                    required=settings.execution.min_seconds_to_event_close,
+                )
+                continue
         worst_unwind_loss = estimate_worst_case_unwind_loss(candidate.opportunity)
         if worst_unwind_loss is None:
             logger.warning("execution_skipped_insufficient_exit_depth", event_ticker=candidate.event_ticker)
@@ -1383,8 +1412,10 @@ async def _reprice_relationship(
             detection_diagnostics["price_threshold_rejections"] += 1
 
     was_open = candidate.event_ticker in open_opportunities
+    stability_buy = detection_diagnostics.setdefault("edge_stability_ticks", {"buy_basket": {}, "buy_all_no": {}})["buy_basket"]
     if opportunity is not None:
         open_opportunities[candidate.event_ticker] = opportunity
+        stability_buy[candidate.event_ticker] = stability_buy.get(candidate.event_ticker, 0) + 1
         if not was_open:
             logger.info(
                 "opportunity_detected",
@@ -1401,6 +1432,7 @@ async def _reprice_relationship(
                 store.record_opportunity(opportunity)
         if settings.execution.enabled and execution_client is not None:
             await _reconcile_execution(
+                stability_buy,
                 open_opportunities, executed_opportunities, relationship_by_event_ticker, execution_client,
                 market_data_client, settings, balance_cache, circuit_breaker, believed_positions,
                 risk_state, store,
@@ -1408,6 +1440,7 @@ async def _reprice_relationship(
     elif was_open:
         del open_opportunities[candidate.event_ticker]
         executed_opportunities.discard(candidate.event_ticker)
+        stability_buy.pop(candidate.event_ticker, None)
         logger.info("opportunity_closed", event_ticker=candidate.event_ticker)
 
     if open_no_opportunities is not None:
@@ -1420,8 +1453,10 @@ async def _reprice_relationship(
             fee_multiplier=candidate.fee_multiplier,
         )
         was_no_open = candidate.event_ticker in open_no_opportunities
+        stability_no = detection_diagnostics.setdefault("edge_stability_ticks", {"buy_basket": {}, "buy_all_no": {}})["buy_all_no"]
         if no_opportunity is not None:
             open_no_opportunities[candidate.event_ticker] = no_opportunity
+            stability_no[candidate.event_ticker] = stability_no.get(candidate.event_ticker, 0) + 1
             if not was_no_open:
                 logger.info(
                     "opportunity_detected",
@@ -1438,6 +1473,7 @@ async def _reprice_relationship(
                     store.record_opportunity(no_opportunity)
             if settings.execution.enabled and execution_client is not None and executed_no_opportunities is not None:
                 await _reconcile_execution(
+                    stability_no,
                     open_no_opportunities, executed_no_opportunities, relationship_by_event_ticker, execution_client,
                     market_data_client, settings, balance_cache, circuit_breaker, believed_positions,
                     risk_state, store,
@@ -1446,6 +1482,7 @@ async def _reprice_relationship(
             del open_no_opportunities[candidate.event_ticker]
             if executed_no_opportunities is not None:
                 executed_no_opportunities.discard(candidate.event_ticker)
+            stability_no.pop(candidate.event_ticker, None)
             logger.info("opportunity_closed", event_ticker=candidate.event_ticker)
 
 
@@ -1503,6 +1540,11 @@ async def _stream_shortlist(
         "insufficient_depth_rejections": 0,
         "price_threshold_rejections": 0,
         "closest_baskets": {},
+        # Per-direction, per-event consecutive-tick counts the edge has
+        # remained priced-through. Carried in diagnostics so no new signatures
+        # need threading; _reconcile_execution gates on
+        # settings.execution.min_edge_stability_ticks reading these.
+        "edge_stability_ticks": {"buy_basket": {}, "buy_all_no": {}},
     }
 
     async for msg in ws_client.stream(list(books.keys())):
@@ -1539,12 +1581,15 @@ async def _stream_shortlist(
                 # of THIS opportunity's own legs, so a long-open, still-
                 # unexecuted candidate could otherwise go unreconsidered
                 # between its own ticks.
+                stability_map = detection_diagnostics["edge_stability_ticks"]
                 await _reconcile_execution(
+                    stability_map["buy_basket"],
                     open_opportunities, executed_opportunities, relationship_by_event_ticker, execution_client,
                     market_data_client, settings, balance_cache, circuit_breaker, believed_positions,
                     risk_state, store,
                 )
                 await _reconcile_execution(
+                    stability_map["buy_all_no"],
                     open_no_opportunities, executed_no_opportunities, relationship_by_event_ticker, execution_client,
                     market_data_client, settings, balance_cache, circuit_breaker, believed_positions,
                     risk_state, store,

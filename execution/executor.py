@@ -450,8 +450,9 @@ async def _cancel_unfilled_remainders(demo_client: KalshiClient, leg_results: li
                 pass
 
 
-_ORDER_READ_RETRIES = 3
-_ORDER_READ_BACKOFF_S = 0.25
+_ORDER_READ_RETRIES = 5
+_ORDER_READ_BACKOFF_S = 0.25   # applied as exponential: 0.25, 0.5, 1.0, 2.0 (cumulative 3.75s) between attempts
+_ORDER_READ_BACKOFF_CAP_S = 2.0
 
 
 async def _read_order_authoritative(
@@ -475,7 +476,8 @@ async def _read_order_authoritative(
         except ExchangeError as exc:
             last = str(exc)
             if attempt + 1 < _ORDER_READ_RETRIES:
-                await asyncio.sleep(_ORDER_READ_BACKOFF_S)
+                backoff = min(_ORDER_READ_BACKOFF_S * (2 ** attempt), _ORDER_READ_BACKOFF_CAP_S)
+                await asyncio.sleep(backoff)
 
     # Same handle the ambiguity path uses; it reads every status, so an order
     # that filled and closed is still found.
