@@ -67,3 +67,23 @@ execution:
   min_seconds_to_event_close: 300                               # 2026-11-09: refuse baskets within 5 minutes of settlement. Nov 4 incident shape: a basket fired 6+ hours past settle had leg BB reject (no resting volume) and no unwind could fill — the market was dead. A 5-min buffer leaves room for unwind to execute while the book is still alive.
   process_lock_path: "data/execution.lock"                      # prevents concurrent armed scanner processes
   alerts_log_path: "data/alerts.jsonl"                         # local incident stream; prod also requires Telegram or a generic webhook
+
+# Maker-side strategy: posts resting GTC limit orders on basket legs, gets
+# paid the rebalancing spread when the book drifts through the quote (see
+# execution/maker/). Disabled here on purpose — this is the sibling strategy
+# to the taker-side execution: block above, run from scripts/run_maker_scanner.py
+# with its OWN risk-state file, order store, and process lock. The taker is
+# unchanged by this section's presence; a settings.yaml without a
+# maker_execution: block loads fine (see config/loader.py's _load_maker_execution).
+maker_execution:
+  enabled: false                                                # explicit arm switch
+  target: "demo"                                                # "demo" or "prod"
+  prod_enabled: false                                           # prod additionally requires this + same env/webhook safeguards as taker (not yet duplicated here — ship-disabled)
+  target_margin_per_basket: 0.03                                # if every quote fills, we want 3c net $ margin per basket after fees
+  max_inventory_per_event_usd: 2.0                              # per-event hard cap — new quotes refused once this is reached
+  quote_offset_ticks: 1                                         # rest buy at mid - 1 tick ($0.01); larger = wider resting edge, slower fill
+  requote_threshold_ticks: 2                                    # if mid moves 2 ticks against a resting order, cancel+replace it
+  max_resting_order_age_s: 300                                  # stale quotes get cancelled regardless of drift
+  flatten_on_leg_fill: true                                     # once one leg fills, aggressively complete or unwind the basket
+  max_concurrent_quoted_events: 3                               # ceiling on simultaneously quoted events
+  strategy_id: "maker-v1"                                       # tags client_order_ids and the risk-state header; keeps ownership unambiguous when maker + taker run against the same account

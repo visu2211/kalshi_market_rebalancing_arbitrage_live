@@ -103,6 +103,33 @@ class ExecutionSettings:
 
 
 @dataclass(frozen=True)
+class MakerExecutionSettings:
+    """Sibling of ExecutionSettings for the maker-side strategy variant
+    (resting GTC limit orders to earn the rebalancing spread, rather than
+    FOK taker orders to capture a visible edge). Entirely separate state
+    paths from ExecutionSettings so the two strategies never share a
+    risk-state file or order store. Disabled by default; a missing
+    `maker_execution:` block in settings.yaml loads cleanly and leaves this
+    at its own defaults."""
+
+    enabled: bool                                  # explicit arm switch, default False
+    target: str                                    # "demo" or "prod", default "demo"
+    prod_enabled: bool                             # default False — same two-flag gate as taker
+    target_margin_per_basket: Decimal              # required net $ margin per basket if every quote fills (post-fee); if the quoter cannot construct a basket meeting this, no orders are posted
+    max_inventory_per_event_usd: Decimal           # per-event hard cap on accumulated open+filled exposure; new quotes refused once reached
+    quote_offset_ticks: int                        # how many ticks below each leg's mid to rest the buy (margin accrues from the aggregate offset)
+    requote_threshold_ticks: int                   # if mid drifts this many ticks against a resting order, cancel + replace it at the new mid
+    max_resting_order_age_s: int                   # cancel any order older than this regardless of mid drift — stops stale quotes accumulating across rescans
+    flatten_on_leg_fill: bool                      # when one leg of a quoted basket fills, aggressively complete or unwind the rest rather than waiting for them to fill on their own
+    max_concurrent_quoted_events: int              # how many events can carry active quotes at once — caps WS/order noise
+    strategy_id: str                               # written into client_order_id prefix and the risk-state file header, so order ownership is unambiguous across strategies on the same account
+    risk_state_path: Path                          # separate from execution.risk_state_path on purpose (plan's isolation decision)
+    orders_log_path: Path                          # same
+    order_store_path: Path                         # separate SQLite file from execution.store's data/orders.sqlite3
+    process_lock_path: Path                        # separate flock so taker + maker can run simultaneously
+
+
+@dataclass(frozen=True)
 class Settings:
     kalshi: KalshiSettings
     scanner: ScannerSettings
@@ -110,6 +137,7 @@ class Settings:
     relationships: RelationshipsSettings
     logging: LoggingSettings
     execution: ExecutionSettings
+    maker_execution: MakerExecutionSettings
 
 
 def load_settings(path: Path = DEFAULT_SETTINGS_PATH) -> Settings:
@@ -180,6 +208,7 @@ def load_settings(path: Path = DEFAULT_SETTINGS_PATH) -> Settings:
     relationships_raw = _optional_section("relationships")
     logging_raw = _section("logging")
     execution_raw = _section("execution")
+    maker_execution_raw = _optional_section("maker_execution")
 
     target = _required(execution_raw, "target", "execution")
     if target not in {"demo", "prod"}:
@@ -353,4 +382,36 @@ def load_settings(path: Path = DEFAULT_SETTINGS_PATH) -> Settings:
             telegram_bot_token=telegram_bot_token,
             telegram_chat_id=telegram_chat_id,
         ),
+        maker_execution=_load_maker_execution(maker_execution_raw, _resolve, _bool, _int, _decimal),
+    )
+
+
+def _load_maker_execution(raw, resolve, _bool, _int, _decimal) -> MakerExecutionSettings:
+    """Parses the optional `maker_execution:` block. Every field has a
+    conservative default so a settings.yaml without this section (as the
+    live taker config currently is) loads cleanly, with the maker strategy
+    disabled."""
+    target = raw.get("target", "demo")
+    if target not in {"demo", "prod"}:
+        raise ConfigurationError("maker_execution.target must be exactly 'demo' or 'prod'")
+    enabled = _bool(raw.get("enabled", False), "maker_execution.enabled")
+    prod_enabled = _bool(raw.get("prod_enabled", False), "maker_execution.prod_enabled")
+    if enabled and target == "prod" and not prod_enabled:
+        raise ConfigurationError("maker_execution prod requires maker_execution.prod_enabled: true")
+    return MakerExecutionSettings(
+        enabled=enabled,
+        target=target,
+        prod_enabled=prod_enabled,
+        target_margin_per_basket=_decimal(raw.get("target_margin_per_basket", "0.03"), "maker_execution.target_margin_per_basket", strictly_positive=True, maximum="1"),
+        max_inventory_per_event_usd=_decimal(raw.get("max_inventory_per_event_usd", "2"), "maker_execution.max_inventory_per_event_usd", strictly_positive=True),
+        quote_offset_ticks=_int(raw.get("quote_offset_ticks", 1), "maker_execution.quote_offset_ticks", minimum=1),
+        requote_threshold_ticks=_int(raw.get("requote_threshold_ticks", 2), "maker_execution.requote_threshold_ticks", minimum=1),
+        max_resting_order_age_s=_int(raw.get("max_resting_order_age_s", 300), "maker_execution.max_resting_order_age_s", minimum=1),
+        flatten_on_leg_fill=_bool(raw.get("flatten_on_leg_fill", True), "maker_execution.flatten_on_leg_fill"),
+        max_concurrent_quoted_events=_int(raw.get("max_concurrent_quoted_events", 3), "maker_execution.max_concurrent_quoted_events", minimum=1),
+        strategy_id=str(raw.get("strategy_id", "maker-v1")),
+        risk_state_path=resolve(raw.get("risk_state_path", "data/risk_state_maker.json")),
+        orders_log_path=resolve(raw.get("orders_log_path", "data/orders_maker.jsonl")),
+        order_store_path=resolve(raw.get("order_store_path", "data/orders_maker.sqlite3")),
+        process_lock_path=resolve(raw.get("process_lock_path", "data/execution_maker.lock")),
     )
