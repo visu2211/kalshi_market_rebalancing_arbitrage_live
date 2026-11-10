@@ -191,7 +191,7 @@ class MakerMonitor:
                 pass
 
     async def _refresh_shortlist(self) -> None:
-        raw_events = await self.public_client.get_events(status="open", with_nested_markets=True)
+        raw_events = await self.public_client.get_all_events(status="open", with_nested_markets=True)
         candidates = filter_events(
             raw_events,
             min_outcome_legs=self.settings.scanner.min_outcome_legs,
