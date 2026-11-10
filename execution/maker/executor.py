@@ -198,6 +198,7 @@ async def execute_opportunity_maker(
         opportunity.event_ticker,
         [lq.ticker for lq in quote.leg_quotes],
         quote.size,
+        direction=opportunity.direction,
     )
     risk.record_basket_attempt(opportunity.event_ticker)
 
@@ -361,6 +362,17 @@ async def manage_fill_event(
     # (falling back to the emergency floor if a bid isn't visible — this
     # is the same "take what you can get" shape execution/executor.py uses
     # for its emergency unwind).
+    #
+    # Direction-aware side selection: a buy_basket basket held YES on every
+    # leg, so flatten sells YES at the YES bid. A buy_all_no basket held
+    # NO on every leg, so flatten sells NO at the NO bid — which Kalshi
+    # doesn't quote directly, so caller passes the synthesized NO bid
+    # (1 - YES ask) in `exit_bids`. Same symmetry as the taker's
+    # _position_side / _exit_price pair in execution/executor.py.
+    inv_snapshot = inventory.snapshot().get(event_ticker)
+    direction = inv_snapshot.direction if inv_snapshot else "buy_basket"
+    flatten_side = Side.YES if direction == "buy_basket" else Side.NO
+
     for cancel_ticker in action.tickers_to_cancel:
         order_id = resting_order_ids.get(cancel_ticker)
         if order_id is None:
@@ -377,7 +389,7 @@ async def manage_fill_event(
         coid = _new_client_order_id("flatten")
         order = OrderRequest(
             market_id=excess_ticker,
-            side=Side.YES,                        # maker v1 quotes YES-side baskets; NO-side flattening covered when buy_all_no maker ships
+            side=flatten_side,
             action=OrderAction.SELL,
             order_type=OrderType.LIMIT,
             size=excess_size,
@@ -387,7 +399,7 @@ async def manage_fill_event(
         )
         if store is not None:
             store.record_submitted([PendingOrder(
-                client_order_id=coid, ticker=excess_ticker, side=Side.YES.value,
+                client_order_id=coid, ticker=excess_ticker, side=flatten_side.value,
                 action=OrderAction.SELL.value, execution_stage="maker_flatten",
                 limit_price=price, size=excess_size,
             )])
@@ -397,12 +409,12 @@ async def manage_fill_event(
         except (AmbiguousSubmissionError, ExchangeError) as exc:
             logger.warning("maker_flatten_failed", ticker=excess_ticker, error=str(exc))
             unwind_results.append(MakerLegResult(
-                ticker=excess_ticker, side=Side.YES, limit_price=price,
+                ticker=excess_ticker, side=flatten_side, limit_price=price,
                 size=excess_size, client_order_id=coid, error=str(exc),
             ))
             continue
         unwind_results.append(MakerLegResult(
-            ticker=excess_ticker, side=Side.YES, limit_price=price,
+            ticker=excess_ticker, side=flatten_side, limit_price=price,
             size=excess_size, client_order_id=coid,
             order_result=result,
             error=None if result and result.status != OrderStatus.REJECTED else _format_rejection(result) if result else "no_result",

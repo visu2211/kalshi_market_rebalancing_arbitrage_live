@@ -252,6 +252,34 @@ async def test_manage_fill_flattens_on_leg_fill():
 
 
 @pytest.mark.asyncio
+async def test_manage_fill_flattens_no_side_for_buy_all_no():
+    # Mirror the YES-side test but for a buy_all_no inventory. The flatten
+    # must go out as a SELL on the NO side (not YES).
+    client = FakeKalshiClient(batch_outcomes=[
+        {"A": (OrderStatus.FILLED, Decimal(1))},
+    ])
+    inv = MakerInventoryBook(flatten_on_leg_fill=True,
+                             max_inventory_per_event_usd=Decimal("5"))
+    inv.open_event("EVT", ["A", "B", "C"], Decimal(1), direction="buy_all_no")
+
+    _ = await manage_fill_event(
+        client, "EVT", "A",
+        cumulative_filled_delta=Decimal(1),
+        fill_price=Decimal("0.68"),
+        remaining_size=Decimal(0),
+        resting_order_ids={"B": "order-B-1", "C": "order-C-1"},
+        inventory=inv,
+        exit_bids={"A": Decimal("0.65")},
+    )
+
+    # Flatten order must be on the NO side, not YES
+    sell = client.batch_calls[0][0]
+    assert sell.market_id == "A"
+    assert sell.side == Side.NO
+    assert sell.action.value == "sell"
+
+
+@pytest.mark.asyncio
 async def test_manage_fill_basket_complete_no_cancel_no_sell():
     # flatten_on_leg_fill=False so the first fill is NO_ACTION and the
     # second fill brings the basket to parity (all at target_size).

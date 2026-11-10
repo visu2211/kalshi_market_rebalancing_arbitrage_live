@@ -68,6 +68,7 @@ class EventInventory:
     event_ticker: str
     target_size: Decimal                          # uniform size every leg was quoted at
     leg_tickers: list[str]
+    direction: str = "buy_basket"                 # mirrors BasketOpportunity.direction — decides which side flatten sells against
     filled: dict[str, Decimal] = field(default_factory=dict)     # ticker -> contracts filled so far
     resting: set[str] = field(default_factory=set)               # tickers whose GTC order is still live
     notional_at_risk_usd: Decimal = Decimal(0)   # sum of (filled_i * limit_price_i); approximate exposure used for the per-event cap
@@ -106,16 +107,20 @@ class MakerInventoryBook:
         event_ticker: str,
         leg_tickers: list[str],
         target_size: Decimal,
+        direction: str = "buy_basket",
     ) -> EventInventory:
         """Begin tracking a newly-quoted event. Idempotent — a second
         call for an event already tracked returns the existing record
-        unchanged (the order_manager may re-emit on requote)."""
+        unchanged (the order_manager may re-emit on requote). `direction`
+        mirrors BasketOpportunity.direction and decides which side the
+        flatten path trades (YES for buy_basket, NO for buy_all_no)."""
         if event_ticker in self._events:
             return self._events[event_ticker]
         inv = EventInventory(
             event_ticker=event_ticker,
             target_size=target_size,
             leg_tickers=list(leg_tickers),
+            direction=direction,
             resting=set(leg_tickers),
         )
         self._events[event_ticker] = inv
