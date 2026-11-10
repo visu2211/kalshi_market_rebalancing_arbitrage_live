@@ -31,8 +31,10 @@ Entrypoint: scripts/run_maker_scanner.py.
 from __future__ import annotations
 
 import asyncio
+import json
 import signal
 import time
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Optional
@@ -142,11 +144,13 @@ class MakerMonitor:
     async def run(self) -> None:
         """Entrypoint. Returns cleanly when _shutdown is set (SIGINT/TERM
         or breaker trip)."""
+        mk = self.settings.maker_execution
         logger.info("maker_monitor_start",
-                    strategy_id=self.settings.maker_execution.strategy_id,
-                    target=self.settings.maker_execution.target,
-                    enabled=self.settings.maker_execution.enabled)
-        if not self.settings.maker_execution.enabled:
+                    strategy_id=mk.strategy_id,
+                    target=mk.target,
+                    enabled=mk.enabled,
+                    observe_only=mk.observe_only)
+        if not mk.enabled and not mk.observe_only:
             logger.warning("maker_monitor_disabled — exiting without placing orders")
             return
         if self.risk.tripped:
@@ -283,6 +287,9 @@ class MakerMonitor:
         return legs
 
     async def _quote_and_submit(self, opportunity) -> None:
+        if self.settings.maker_execution.observe_only:
+            await self._observe_only_log(opportunity)
+            return
         try:
             result: MakerExecutionResult = await execute_opportunity_maker(
                 self.exec_client, opportunity,
@@ -316,6 +323,71 @@ class MakerMonitor:
             expected_margin_usd=str(result.quote.expected_margin_usd) if result.quote else "",
         )
 
+    async def _observe_only_log(self, opportunity) -> None:
+        """observe_only mode: run the quote math and append the result to
+        a JSONL (never call the exchange). Caller analyzes the file
+        later to measure fill rate / adverse selection against real
+        forward book data.
+
+        Writes to settings.maker_execution.orders_log_path with a
+        maker_would_quote type tag so a later analyzer can walk the file
+        and, for each row, check against stream history whether the quote
+        would have filled before being canceled or out-of-the-money."""
+        from execution.maker.quoter import quote_basket
+        mk = self.settings.maker_execution
+        quote = quote_basket(
+            opportunity,
+            quote_offset_ticks=mk.quote_offset_ticks,
+            target_margin_per_basket=mk.target_margin_per_basket,
+            size=opportunity.max_size,
+        )
+        if quote is None:
+            return
+        record = {
+            "at": datetime.now(timezone.utc).isoformat(),
+            "type": "maker_would_quote",
+            "event_ticker": opportunity.event_ticker,
+            "direction": opportunity.direction,
+            "size": str(quote.size),
+            "expected_basket_cost_usd": str(quote.expected_basket_cost_usd),
+            "expected_margin_usd": str(quote.expected_margin_usd),
+            "legs": [
+                {
+                    "ticker": lq.ticker,
+                    "side": lq.side.value,
+                    "price": str(lq.price),
+                    "mid": str(lq.mid),
+                    "ask_at_quote": str(self._ask_for(lq.ticker)),
+                    "bid_at_quote": str(self._bid_for(lq.ticker)),
+                }
+                for lq in quote.leg_quotes
+            ],
+        }
+        path = mk.orders_log_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
+            f.write(json.dumps(record) + "\n")
+        logger.info(
+            "maker_would_quote",
+            event_ticker=opportunity.event_ticker,
+            direction=opportunity.direction,
+            margin_usd=str(quote.expected_margin_usd),
+        )
+
+    def _ask_for(self, ticker: str) -> Decimal:
+        book = self.books.get(ticker)
+        if book is None:
+            return Decimal(0)
+        q = book.best_yes_quote()
+        return q[0] if q else Decimal(0)
+
+    def _bid_for(self, ticker: str) -> Decimal:
+        book = self.books.get(ticker)
+        if book is None:
+            return Decimal(0)
+        q = book.best_yes_quote()
+        return q[2] if q else Decimal(0)
+
     # ---- Private WS (fills) ----
 
     async def _private_ws_loop(self) -> None:
@@ -323,12 +395,19 @@ class MakerMonitor:
         to manage_fill_event with the delta since the last report on this
         order_id.
 
+        observe_only mode skips this entirely — there are no orders to
+        track fills for.
+
         Kalshi's exact v2 private-channel shape is not canonically captured
         in this repo yet — the parsing below tolerates the fields it can
         find and logs anything it can't, so a schema surprise degrades
         gracefully. First live message will tell us whether this matches
         reality; if not, tune the field names here without touching the
         inventory or executor layers."""
+        if self.settings.maker_execution.observe_only:
+            logger.info("maker_private_ws_skipped_observe_only")
+            await self._shutdown.wait()
+            return
         while not self._shutdown.is_set():
             try:
                 async for msg in self.private_ws.stream([], channels=_PRIVATE_CHANNELS):

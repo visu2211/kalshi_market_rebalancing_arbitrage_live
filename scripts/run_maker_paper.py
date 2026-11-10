@@ -133,15 +133,28 @@ def _summary_line(label: str, results: list[SimResult]) -> str:
         return f"{label:<40} (no opportunities)"
     quoted = [r for r in results if r.would_quote]
     quote_rate = 100.0 * len(quoted) / n
-    if quoted:
-        margins = sorted(r.expected_margin_usd for r in quoted)
-        median = margins[len(margins) // 2]
-        gross_if_all_fill = sum((m for m in margins), Decimal(0))
-        return (
-            f"{label:<40} n={n:>4}  quoted={len(quoted):>4} ({quote_rate:5.1f}%)  "
-            f"median_margin=${median:.4f}  gross_if_all_fill=${gross_if_all_fill:.2f}"
-        )
-    return f"{label:<40} n={n:>4}  quoted={0:>4} (  0.0%)"
+    if not quoted:
+        return f"{label:<40} n={n:>4}  quoted={0:>4} (  0.0%)"
+
+    margins = sorted(r.expected_margin_usd for r in quoted)
+    median = margins[len(margins) // 2]
+    gross_if_all_fill = sum((m for m in margins), Decimal(0))
+    # Breakeven fill rate: what fraction of placed baskets must COMPLETELY fill
+    # to cover losses from the ones that partially-fill-then-flatten? A
+    # partial-then-flatten basket's worst realistic loss is ~ max_unwind_loss
+    # per leg = ~$0.35 for a size-1 basket (see settings.yaml
+    # max_unwind_loss_usd). Using $0.35 flat here; this is a scenario floor,
+    # not a prediction.
+    worst_loss_per_dud = Decimal("0.35")
+    # avg_gain * fill_rate >= avg_loss * (1 - fill_rate)
+    # fill_rate >= avg_loss / (avg_gain + avg_loss)
+    avg_gain = gross_if_all_fill / len(quoted)
+    breakeven_fill = worst_loss_per_dud / (avg_gain + worst_loss_per_dud) * 100
+    return (
+        f"{label:<40} n={n:>4}  quoted={len(quoted):>4} ({quote_rate:5.1f}%)  "
+        f"median_margin=${median:.4f}  gross_if_all_fill=${gross_if_all_fill:>7.2f}  "
+        f"breakeven_fill_rate={breakeven_fill:5.1f}%"
+    )
 
 
 def _run_single(args, log_path: Path) -> int:

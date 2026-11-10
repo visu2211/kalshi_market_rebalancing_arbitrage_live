@@ -78,7 +78,7 @@ def _configure_logging(level: str) -> None:
 
 async def run(settings: Settings) -> None:
     mk = settings.maker_execution
-    if not mk.enabled:
+    if not mk.enabled and not mk.observe_only:
         logger.warning("maker_disabled — nothing to do", strategy_id=mk.strategy_id)
         return
 
@@ -91,7 +91,13 @@ async def run(settings: Settings) -> None:
             private_key_path=settings.kalshi.private_key_path,
         ))
 
-        if mk.target == "prod":
+        # observe_only never submits or reads private channels, so it doesn't
+        # need an exec client at all — reuse public_client to satisfy the
+        # MakerMonitor constructor. This also means observe_only can run on
+        # prod without the maker ever holding prod execution credentials.
+        if mk.observe_only and not mk.enabled:
+            exec_client = public_client
+        elif mk.target == "prod":
             exec_client = await stack.enter_async_context(KalshiClient(
                 base_url=settings.kalshi.base_url,
                 request_timeout_s=settings.kalshi.request_timeout_s,
@@ -149,7 +155,7 @@ def main() -> None:
 
     lock_ctx = (
         _maker_process_lock(mk.process_lock_path)
-        if mk.enabled else contextlib.nullcontext()
+        if (mk.enabled or mk.observe_only) else contextlib.nullcontext()
     )
     with lock_ctx:
         asyncio.run(run(settings))

@@ -79,6 +79,7 @@ maker_execution:
   enabled: false                                                # explicit arm switch
   target: "demo"                                                # "demo" or "prod"
   prod_enabled: false                                           # prod additionally requires this + same env/webhook safeguards as taker (not yet duplicated here — ship-disabled)
+  observe_only: false                                           # when true, the monitor runs the full detection + quote math but logs "maker_would_quote" rows to orders_log_path instead of submitting. Safe to enable on prod — no credentials needed beyond public WS auth. Use this to collect real forward fill-rate data before arming with capital.
   target_margin_per_basket: 0.03                                # if every quote fills, we want 3c net $ margin per basket after fees
   max_inventory_per_event_usd: 2.0                              # per-event hard cap — new quotes refused once this is reached
   quote_offset_ticks: 1                                         # rest buy at mid - 1 tick ($0.01); larger = wider resting edge, slower fill

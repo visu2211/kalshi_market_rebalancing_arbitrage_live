@@ -115,6 +115,7 @@ class MakerExecutionSettings:
     enabled: bool                                  # explicit arm switch, default False
     target: str                                    # "demo" or "prod", default "demo"
     prod_enabled: bool                             # default False — same two-flag gate as taker
+    observe_only: bool                             # default False. When True the monitor runs the full detection + quote math but never calls place_orders_batch — writes a maker_would_quote JSONL row instead. Used to collect fill-rate / adverse-selection data forward in time against real prod WS, without ever submitting orders. Safe to enable on prod.
     target_margin_per_basket: Decimal              # required net $ margin per basket if every quote fills (post-fee); if the quoter cannot construct a basket meeting this, no orders are posted
     max_inventory_per_event_usd: Decimal           # per-event hard cap on accumulated open+filled exposure; new quotes refused once reached
     quote_offset_ticks: int                        # how many ticks below each leg's mid to rest the buy (margin accrues from the aggregate offset)
@@ -402,6 +403,7 @@ def _load_maker_execution(raw, resolve, _bool, _int, _decimal) -> MakerExecution
         enabled=enabled,
         target=target,
         prod_enabled=prod_enabled,
+        observe_only=_bool(raw.get("observe_only", False), "maker_execution.observe_only"),
         target_margin_per_basket=_decimal(raw.get("target_margin_per_basket", "0.03"), "maker_execution.target_margin_per_basket", strictly_positive=True, maximum="1"),
         max_inventory_per_event_usd=_decimal(raw.get("max_inventory_per_event_usd", "2"), "maker_execution.max_inventory_per_event_usd", strictly_positive=True),
         quote_offset_ticks=_int(raw.get("quote_offset_ticks", 1), "maker_execution.quote_offset_ticks", minimum=1),
