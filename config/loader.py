@@ -116,6 +116,7 @@ class MakerExecutionSettings:
     target: str                                    # "demo" or "prod", default "demo"
     prod_enabled: bool                             # default False — same two-flag gate as taker
     observe_only: bool                             # default False. When True the monitor runs the full detection + quote math but never calls place_orders_batch — writes a maker_would_quote JSONL row instead. Used to collect fill-rate / adverse-selection data forward in time against real prod WS, without ever submitting orders. Safe to enable on prod.
+    pricing_prior: str                             # "mid" (default, backwards-compat) or "implied_probability" (normalize so Σ p_i = 1 across the basket, pushing quotes further below overpriced legs). See execution/maker/quoter.py.
     target_margin_per_basket: Decimal              # required net $ margin per basket if every quote fills (post-fee); if the quoter cannot construct a basket meeting this, no orders are posted
     max_inventory_per_event_usd: Decimal           # per-event hard cap on accumulated open+filled exposure; new quotes refused once reached
     quote_offset_ticks: int                        # how many ticks below each leg's mid to rest the buy (margin accrues from the aggregate offset)
@@ -399,11 +400,17 @@ def _load_maker_execution(raw, resolve, _bool, _int, _decimal) -> MakerExecution
     prod_enabled = _bool(raw.get("prod_enabled", False), "maker_execution.prod_enabled")
     if enabled and target == "prod" and not prod_enabled:
         raise ConfigurationError("maker_execution prod requires maker_execution.prod_enabled: true")
+    pricing_prior = str(raw.get("pricing_prior", "mid"))
+    if pricing_prior not in {"mid", "implied_probability"}:
+        raise ConfigurationError(
+            f"maker_execution.pricing_prior must be 'mid' or 'implied_probability', got {pricing_prior!r}"
+        )
     return MakerExecutionSettings(
         enabled=enabled,
         target=target,
         prod_enabled=prod_enabled,
         observe_only=_bool(raw.get("observe_only", False), "maker_execution.observe_only"),
+        pricing_prior=pricing_prior,
         target_margin_per_basket=_decimal(raw.get("target_margin_per_basket", "0.03"), "maker_execution.target_margin_per_basket", strictly_positive=True, maximum="1"),
         max_inventory_per_event_usd=_decimal(raw.get("max_inventory_per_event_usd", "2"), "maker_execution.max_inventory_per_event_usd", strictly_positive=True),
         quote_offset_ticks=_int(raw.get("quote_offset_ticks", 1), "maker_execution.quote_offset_ticks", minimum=1),

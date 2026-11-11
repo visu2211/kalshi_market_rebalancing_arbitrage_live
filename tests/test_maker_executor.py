@@ -37,6 +37,7 @@ def _make_settings(tmp_path: Path, enabled: bool = True) -> MakerExecutionSettin
         target="demo",
         prod_enabled=False,
         observe_only=False,
+        pricing_prior="mid",
         target_margin_per_basket=Decimal("0.03"),
         max_inventory_per_event_usd=Decimal("5"),
         quote_offset_ticks=1,

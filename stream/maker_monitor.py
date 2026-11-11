@@ -340,6 +340,7 @@ class MakerMonitor:
             quote_offset_ticks=mk.quote_offset_ticks,
             target_margin_per_basket=mk.target_margin_per_basket,
             size=opportunity.max_size,
+            pricing_prior=mk.pricing_prior,
         )
         if quote is None:
             return

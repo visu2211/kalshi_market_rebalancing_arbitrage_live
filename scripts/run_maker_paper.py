@@ -106,6 +106,7 @@ def simulate(
     quote_offset_ticks: int,
     target_margin_per_basket: Decimal,
     size: Decimal = Decimal(1),
+    pricing_prior: str = "mid",
 ) -> list[SimResult]:
     """Run each opportunity through quote_basket and summarize per-row."""
     results: list[SimResult] = []
@@ -115,6 +116,7 @@ def simulate(
             quote_offset_ticks=quote_offset_ticks,
             target_margin_per_basket=target_margin_per_basket,
             size=size,
+            pricing_prior=pricing_prior,
         )
         results.append(SimResult(
             event_ticker=opp.event_ticker,
@@ -164,8 +166,9 @@ def _run_single(args, log_path: Path) -> int:
         quote_offset_ticks=args.offset,
         target_margin_per_basket=Decimal(str(args.target_margin)),
         size=Decimal(str(args.size)),
+        pricing_prior=args.prior,
     )
-    label = f"offset={args.offset} target={args.target_margin}"
+    label = f"prior={args.prior} offset={args.offset} target={args.target_margin}"
     print(_summary_line(label, results))
     if args.verbose:
         for r in results[:20]:
@@ -178,19 +181,21 @@ def _run_single(args, log_path: Path) -> int:
 def _run_grid(args, log_path: Path) -> int:
     opps = list(_load(log_path, args.direction))
     offsets = [1, 2, 3, 5, 10]
-    targets = [Decimal("0.01"), Decimal("0.02"), Decimal("0.03"),
-               Decimal("0.05"), Decimal("0.10")]
-    print(f"grid search over {len(offsets)}x{len(targets)} configs, {len(opps)} opportunities")
-    print("-" * 110)
-    for offset in offsets:
-        for target in targets:
-            results = simulate(
-                iter(opps),
-                quote_offset_ticks=offset,
-                target_margin_per_basket=target,
-                size=Decimal(str(args.size)),
-            )
-            print(_summary_line(f"offset={offset:<3} target=${target}", results))
+    targets = [Decimal("0.01"), Decimal("0.03"), Decimal("0.05"), Decimal("0.10")]
+    priors = ["mid", "implied_probability"]
+    print(f"grid search over {len(priors)}x{len(offsets)}x{len(targets)} configs, {len(opps)} opportunities")
+    print("-" * 120)
+    for prior in priors:
+        for offset in offsets:
+            for target in targets:
+                results = simulate(
+                    iter(opps),
+                    quote_offset_ticks=offset,
+                    target_margin_per_basket=target,
+                    size=Decimal(str(args.size)),
+                    pricing_prior=prior,
+                )
+                print(_summary_line(f"prior={prior:<20} offset={offset:<3} target=${target}", results))
     return 0
 
 
@@ -201,6 +206,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--offset", type=int, default=1, help="quote_offset_ticks")
     p.add_argument("--target-margin", type=str, default="0.03")
     p.add_argument("--size", type=str, default="1")
+    p.add_argument("--prior", choices=["mid", "implied_probability"], default="mid",
+                   help="pricing_prior (see execution/maker/quoter.py)")
     p.add_argument("--direction", choices=["buy_basket", "buy_all_no"],
                    default=None, help="filter to one direction (default: both)")
     p.add_argument("--grid", action="store_true",

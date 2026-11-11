@@ -165,6 +165,7 @@ async def execute_opportunity_maker(
         quote_offset_ticks=settings.quote_offset_ticks,
         target_margin_per_basket=settings.target_margin_per_basket,
         size=opportunity.max_size,
+        pricing_prior=settings.pricing_prior,
     )
     if quote is None:
         return MakerExecutionResult(

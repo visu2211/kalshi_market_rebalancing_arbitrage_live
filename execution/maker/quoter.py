@@ -70,24 +70,71 @@ def _mid(leg: LegQuote) -> Decimal:
     return (leg.best_bid + leg.best_ask) / Decimal(2)
 
 
-def _target_quote(direction: str, leg: LegQuote, offset_ticks: int) -> tuple[Side, Decimal, Decimal]:
-    """Return (side_to_buy, target_price, reference_mid) for a resting
-    BUY on this leg given the basket direction.
+# ----- Pricing priors (fair-value estimate per leg) -------------------
+# A prior is a function (legs) -> {ticker: fair_yes_prob}. Deliberately
+# ignores direction — the fair YES probability per leg is a property of
+# the market, not of which side we're trading. Caller flips to NO if
+# needed.
 
-    - buy_basket: we want YES on this leg. Mid is of the YES side. Rest a
-      BUY YES at mid_yes - offset.
-    - buy_all_no: we want NO on this leg. Mid is of the NO side, which
-      Kalshi doesn't quote directly — synthesize it the same way
-      scanner.basket.compute_no_opportunity synthesizes the NO ask:
-      mid_no = 1 - mid_yes. Rest a BUY NO at mid_no - offset.
+def _mid_prior(legs: list[LegQuote]) -> dict[str, Decimal]:
+    """Each leg's raw (best_bid + best_ask) / 2. No cross-leg correction."""
+    return {leg.ticker: _mid(leg) for leg in legs}
+
+
+def _implied_probability_prior(legs: list[LegQuote]) -> dict[str, Decimal]:
+    """Normalize the mids so Σp_i = 1 across the basket — which is the
+    structural constraint of a mutually-exclusive + collectively-exhaustive
+    basket (exactly one leg resolves YES, so the TRUE probabilities sum
+    to exactly 1).
+
+    Observable Σ mid_i is usually > 1 on an open book because of the
+    bid-ask spread tax carried by every leg; 1.05-1.20 is typical on
+    thin markets. That extra mass is literally the maker's opportunity:
+    somewhere in the basket, at least one leg is above its fair value.
+    Normalizing distributes the correction proportionally, so each leg's
+    prior drops a bit below its mid — and our BUY quote at
+    (prior - offset) ends up placed further from the overpriced ask,
+    which should mean:
+      (a) fewer fills on the overpriced side (we're more patient)
+      (b) fewer adverse-selection fills (a "run" has further to go before
+          it crosses our quote)
+
+    Degenerate case: Σ mid_i <= 0 (crossed book on every leg) or any
+    mid outside (0, 1) — fall back to raw mid. incoherent_legs upstream
+    already rejects these, so this is a safety net."""
+    raw = {leg.ticker: _mid(leg) for leg in legs}
+    total = sum(raw.values(), Decimal(0))
+    if total <= 0 or not total.is_finite():
+        return raw
+    return {t: m / total for t, m in raw.items()}
+
+
+_PRIORS = {
+    "mid": _mid_prior,
+    "implied_probability": _implied_probability_prior,
+}
+
+
+def _target_quote(
+    direction: str,
+    leg: LegQuote,
+    offset_ticks: int,
+    yes_fair_prob: Decimal,
+) -> tuple[Side, Decimal, Decimal]:
+    """Return (side_to_buy, target_price, reference_fair_yes_prob) for a
+    resting BUY on this leg given the basket direction.
+
+    - buy_basket: BUY YES at (yes_fair_prob - offset)
+    - buy_all_no: BUY NO at ((1 - yes_fair_prob) - offset)
+      — symmetric with scanner.basket.compute_no_opportunity's
+      1 - best_yes_bid synthesis.
     """
-    mid_yes = _mid(leg)
     offset = Decimal(offset_ticks) * TICK
     if direction == "buy_basket":
-        return Side.YES, mid_yes - offset, mid_yes
+        return Side.YES, yes_fair_prob - offset, yes_fair_prob
     elif direction == "buy_all_no":
-        mid_no = Decimal(1) - mid_yes
-        return Side.NO, mid_no - offset, mid_no
+        no_fair_prob = Decimal(1) - yes_fair_prob
+        return Side.NO, no_fair_prob - offset, no_fair_prob
     raise ValueError(f"unknown direction: {direction}")
 
 
@@ -98,6 +145,7 @@ def quote_basket(
     target_margin_per_basket: Decimal,
     size: Decimal,
     fee_multiplier: Optional[Decimal] = None,
+    pricing_prior: str = "mid",
 ) -> Optional[MakerQuote]:
     """Compute target maker quotes for `opportunity`. Returns None (no
     orders will be posted) if the resulting basket's expected margin
@@ -111,6 +159,15 @@ def quote_basket(
     `fee_multiplier` defaults to the opportunity's own multiplier — only
     overridden for symmetric testing. Fees are per-leg quadratic the same
     way scanner.basket prices them for the taker side.
+
+    `pricing_prior` picks the fair-value estimator per leg:
+      "mid" (default, backwards-compat): (bid + ask) / 2 per leg, no
+        cross-leg correction. Simple, but suffers if the book carries a
+        bid-ask spread tax (Σ mid_i > 1).
+      "implied_probability": normalize so Σ p_i = 1, which is the real
+        probability constraint of a mutually-exclusive basket. Pushes
+        quotes further below the overpriced side; should reduce
+        adverse-selection fills (the hypothesis behind v2_prior branch).
     """
     if quote_offset_ticks < 1:
         raise ValueError("quote_offset_ticks must be >= 1")
@@ -120,14 +177,20 @@ def quote_basket(
         return None
     if incoherent_legs(opportunity.leg_quotes):
         return None
+    if pricing_prior not in _PRIORS:
+        raise ValueError(f"unknown pricing_prior: {pricing_prior!r} (known: {sorted(_PRIORS)})")
 
     fee_mult = fee_multiplier if fee_multiplier is not None else opportunity.fee_multiplier
+
+    fair_probs = _PRIORS[pricing_prior](opportunity.leg_quotes)
 
     leg_quotes: list[LegQuoteTarget] = []
     total_price = Decimal(0)
     total_fee = Decimal(0)
     for leg in opportunity.leg_quotes:
-        side, price, mid = _target_quote(opportunity.direction, leg, quote_offset_ticks)
+        side, price, mid = _target_quote(
+            opportunity.direction, leg, quote_offset_ticks, fair_probs[leg.ticker]
+        )
         # A quote whose price fell off the tradeable (0, 1) range (e.g. a
         # near-zero mid that the offset would push below $0.01) is
         # structurally impossible — Kalshi would reject it at submission.
