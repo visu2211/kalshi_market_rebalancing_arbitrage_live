@@ -955,7 +955,7 @@ async def _confirm_opportunity_via_rest(
 
 
 async def _reconcile_execution(
-    edge_stability_ticks: dict[str, int],
+    edge_stability_ticks: dict[str, list[Decimal]],
     open_opportunities: dict[str, BasketOpportunity],
     executed_opportunities: set[str],
     relationship_by_event_ticker: dict[str, Relationship],
@@ -1039,13 +1039,26 @@ async def _reconcile_execution(
         # edge lifetime < RTT). Require the edge to have persisted this many
         # consecutive WS ticks on this event before it is executable. Default 1
         # preserves prior behavior.
-        observed_ticks = edge_stability_ticks.get(candidate.event_ticker, 0)
+        history = edge_stability_ticks.get(candidate.event_ticker, [])
+        observed_ticks = len(history)
         if observed_ticks < settings.execution.min_edge_stability_ticks:
             logger.info(
                 "execution_skipped_edge_unstable", event_ticker=candidate.event_ticker,
                 observed_ticks=observed_ticks, required=settings.execution.min_edge_stability_ticks,
             )
             continue
+        # Non-shrinking-edge filter (added 2026-11-11). On 418 live detections
+        # 78% of multi-tick bursts shrank by mean $0.04 — those are edges
+        # dying while the scanner reprices. Reject when the window-end edge
+        # is below the window-start edge; the market is correcting and our
+        # FOK will land after the correction. Default off (backward compat).
+        if settings.execution.require_non_shrinking_edge and len(history) >= 2:
+            if history[-1] < history[0]:
+                logger.info(
+                    "execution_skipped_edge_shrinking", event_ticker=candidate.event_ticker,
+                    edge_first=str(history[0]), edge_last=str(history[-1]),
+                )
+                continue
         # Close-time cutoff. Nov 4 incident: a basket executed 6+ hours after
         # the event had settled had leg BB reject FOK (nothing resting) while
         # leg TL filled — and then no unwind could fill because the market was
@@ -1432,7 +1445,12 @@ async def _reprice_relationship(
     stability_buy = detection_diagnostics.setdefault("edge_stability_ticks", {"buy_basket": {}, "buy_all_no": {}})["buy_basket"]
     if opportunity is not None:
         open_opportunities[candidate.event_ticker] = opportunity
-        stability_buy[candidate.event_ticker] = stability_buy.get(candidate.event_ticker, 0) + 1
+        hist = stability_buy.setdefault(candidate.event_ticker, [])
+        hist.append(opportunity.edge_usd)
+        # Cap the history to the stability window so stale deep-history doesn't
+        # dominate the non-shrinking check — we only care about the current window.
+        if len(hist) > settings.execution.min_edge_stability_ticks:
+            del hist[0:len(hist) - settings.execution.min_edge_stability_ticks]
         if not was_open:
             logger.info(
                 "opportunity_detected",
@@ -1473,7 +1491,10 @@ async def _reprice_relationship(
         stability_no = detection_diagnostics.setdefault("edge_stability_ticks", {"buy_basket": {}, "buy_all_no": {}})["buy_all_no"]
         if no_opportunity is not None:
             open_no_opportunities[candidate.event_ticker] = no_opportunity
-            stability_no[candidate.event_ticker] = stability_no.get(candidate.event_ticker, 0) + 1
+            hist_no = stability_no.setdefault(candidate.event_ticker, [])
+            hist_no.append(no_opportunity.edge_usd)
+            if len(hist_no) > settings.execution.min_edge_stability_ticks:
+                del hist_no[0:len(hist_no) - settings.execution.min_edge_stability_ticks]
             if not was_no_open:
                 logger.info(
                     "opportunity_detected",

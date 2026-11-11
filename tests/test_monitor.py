@@ -873,15 +873,18 @@ async def test_edge_stability_counter_increments_each_tick_and_clears_on_close(t
     await rp()
     await rp()
     await rp()
-    assert detection_diagnostics["edge_stability_ticks"]["buy_basket"]["EVT-R1"] == 3
+    hist = detection_diagnostics["edge_stability_ticks"]["buy_basket"]["EVT-R1"]
+    # History now tracks edge_usd values, capped to min_edge_stability_ticks.
+    # Default stability_ticks=1 so after 3 ticks the capped window is length 1.
+    assert len(hist) == 1
 
-    # Collapse the book so no opportunity remains, then re-tick: counter clears.
+    # Collapse the book so no opportunity remains, then re-tick: history clears.
     books["X"] = _fresh_book(ask=Decimal("0.99"))
     await rp()
     assert "EVT-R1" not in detection_diagnostics["edge_stability_ticks"]["buy_basket"]
     assert "EVT-R1" not in open_opportunities
 
-    # Restore and re-open: counter starts at 1 again, not continues from 3.
+    # Restore and re-open: history starts at length 1 again, not continues.
     books["X"] = _fresh_book()
     await rp()
-    assert detection_diagnostics["edge_stability_ticks"]["buy_basket"]["EVT-R1"] == 1
+    assert len(detection_diagnostics["edge_stability_ticks"]["buy_basket"]["EVT-R1"]) == 1

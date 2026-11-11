@@ -93,6 +93,7 @@ class ExecutionSettings:
     event_cooldown_s: int
     max_unwind_loss_usd: Decimal
     min_edge_stability_ticks: int          # default 1 (no filter) — require the WS edge to persist this many consecutive ticks on the same event before it is executable. Filters flicker edges without adding a REST roundtrip.
+    require_non_shrinking_edge: bool       # default False (no filter). When True, additionally require edge_usd[last] >= edge_usd[first] across the stability window — refuses to submit while the edge is dying in-flight. Measured live 2026-11-11: 78% of multi-tick bursts shrink by mean $0.04, so this filter cuts a lot of detections by design.
     min_seconds_to_event_close: int        # default 0 (no filter) — reject candidates whose nearest leg close_time is within this many seconds. Prevents submitting into a market that already settled, where unwind cannot fill (Nov 4 incident).
     use_canary_submission: bool            # default False (unchanged batched-FOK entry) — when True, execute_opportunity places the thinnest leg alone as a canary; if it fills, the rest are submitted in one batch, if it rejects the basket is aborted with zero naked exposure. Cuts partial-fill risk at the cost of one extra RTT.
     process_lock_path: Path
@@ -345,6 +346,7 @@ def load_settings(path: Path = DEFAULT_SETTINGS_PATH) -> Settings:
             event_cooldown_s=_int(_required(execution_raw, "event_cooldown_s", "execution"), "execution.event_cooldown_s", minimum=1),
             max_unwind_loss_usd=_decimal(_required(execution_raw, "max_unwind_loss_usd", "execution"), "execution.max_unwind_loss_usd", strictly_positive=True, maximum="1"),
             min_edge_stability_ticks=_int(execution_raw.get("min_edge_stability_ticks", 1), "execution.min_edge_stability_ticks", minimum=1),
+            require_non_shrinking_edge=_bool(execution_raw.get("require_non_shrinking_edge", False), "execution.require_non_shrinking_edge"),
             min_seconds_to_event_close=_int(execution_raw.get("min_seconds_to_event_close", 0), "execution.min_seconds_to_event_close", minimum=0),
             use_canary_submission=_bool(execution_raw.get("use_canary_submission", False), "execution.use_canary_submission"),
             process_lock_path=process_lock_path,
