@@ -1775,7 +1775,14 @@ async def run_stage3(
         # so a brief 502 costs seconds rather than a full rescan interval.
         try:
             raw_events = await client.get_all_events(status="open", with_nested_markets=True)
-        except ExchangeError as exc:
+        except (ExchangeError, httpx.HTTPError) as exc:
+            # httpx.ConnectError (DNS failure after a network blip — verified live
+            # 2026-11-10 when the sleeping laptop's wake-up left this call in the
+            # middle of resolving external-api.kalshi.com and the next stage1 pass
+            # crashed the whole scanner) is an httpx.TransportError subclass. The
+            # transport-layer retry inside KalshiClient covers short blips; longer
+            # ones (sleep/standby/wifi drop) exhaust tenacity's 4 attempts and
+            # reraise. ExchangeError alone didn't catch that, so the loop died.
             logger.error("stage1_fetch_failed", error=str(exc), retry_in_s=stage1_backoff_s)
             _write_scanner_status(
                 settings.logging.status_path,
