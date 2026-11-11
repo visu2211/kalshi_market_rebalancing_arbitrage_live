@@ -167,6 +167,28 @@ def _report(bursts: list[Burst]) -> None:
     for n_ticks in (1, 2, 3, 5, 10):
         clears = sum(1 for b in bursts if b.length >= n_ticks)
         print(f"  min_edge_stability_ticks={n_ticks}: {clears} ({100.0 * clears / n:5.1f}%) bursts would have cleared")
+    print()
+
+    # require_non_shrinking_edge retrospective: for the live config
+    # (min_edge_stability_ticks=3), how many bursts clear BOTH gates?
+    # i.e. length >= 3 AND window-end edge >= window-start edge.
+    live_stability = 3
+    cleared_by_stability = [b for b in bursts if b.length >= live_stability]
+    if cleared_by_stability:
+        # The runtime window is capped to min_edge_stability_ticks — so the
+        # "first" of the window is detections[-live_stability], and "last" is
+        # detections[-1]. Non-shrinking = last_edge >= first_edge.
+        non_shrink = [
+            b for b in cleared_by_stability
+            if b.detections[-1].edge_usd >= b.detections[-live_stability].edge_usd
+        ]
+        n_s = len(cleared_by_stability)
+        n_ns = len(non_shrink)
+        cut_rate = 100.0 * (n_s - n_ns) / n_s
+        print(f"With require_non_shrinking_edge AND min_edge_stability_ticks={live_stability}:")
+        print(f"  Bursts clearing stability alone:      {n_s:>4}")
+        print(f"  Bursts also clearing non-shrink:      {n_ns:>4}")
+        print(f"  Filter cuts {cut_rate:4.1f}% of would-fire detections")
 
 
 def main(argv: list[str] | None = None) -> int:
