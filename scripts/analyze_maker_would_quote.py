@@ -136,6 +136,12 @@ def _drift_cancel(leg: LegQuoteRecord, later_mid: Decimal, requote_threshold_tic
 class LegOutcome:
     kind: str                            # FILLED | CANCELED_DRIFT | CANCELED_STALE | OPEN_AT_END
     elapsed_s: float                     # seconds between quote and resolution (or end of walk)
+    # Adverse-selection signal, set only on FILLED: mid_at_fill - mid_at_quote.
+    # For a BUY YES: negative delta means mid fell between quote and fill → ADVERSE
+    #                (we filled at $P, market now values the thing below $P).
+    # For a BUY NO:  positive YES mid delta means yes price went UP → adverse for NO.
+    # Conventionally this field is "adverse_mid_delta": positive = adverse for us.
+    adverse_mid_delta: Decimal | None = None
 
 
 def classify_leg(
@@ -151,15 +157,20 @@ def classify_leg(
         if elapsed > max_age_s:
             return LegOutcome("CANCELED_STALE", max_age_s)
         if leg.ticker not in later.ask:
-            # This later snapshot's event didn't carry this leg — ignore and
-            # keep walking. Shouldn't happen for same-event groupings, but
-            # skip defensively.
             continue
         later_ask = later.ask[leg.ticker]
         later_bid = later.bid[leg.ticker]
         later_mid = later.mid[leg.ticker]
         if _fill_condition(leg, later_ask, later_bid):
-            return LegOutcome("FILLED", elapsed)
+            # Adverse-direction mid delta: positive = market moved AGAINST us
+            # by the time our quote crossed. BUY YES is adverse when mid drops
+            # (so delta = quote_mid - later_mid); BUY NO is adverse when YES mid
+            # rises (so delta = later_mid - quote_mid).
+            if leg.side == "yes":
+                adverse = leg.mid_at_quote - later_mid
+            else:
+                adverse = later_mid - leg.mid_at_quote
+            return LegOutcome("FILLED", elapsed, adverse)
         if _drift_cancel(leg, later_mid, requote_threshold_ticks):
             return LegOutcome("CANCELED_DRIFT", elapsed)
     return LegOutcome("OPEN_AT_END", (later_snaps[-1].at - quote_snap.at).total_seconds() if later_snaps else 0.0)
@@ -191,7 +202,7 @@ def analyze(
     *,
     max_age_s: int,
     requote_threshold_ticks: int,
-) -> tuple[list[BasketOutcome], dict[str, int]]:
+) -> tuple[list[BasketOutcome], dict[str, int], list[Decimal]]:
     by_event: dict[str, list[EventSnapshot]] = defaultdict(list)
     for s in snapshots:
         by_event[s.event_ticker].append(s)
@@ -200,6 +211,7 @@ def analyze(
 
     basket_outcomes: list[BasketOutcome] = []
     leg_counts: dict[str, int] = defaultdict(int)
+    fill_adverse_deltas: list[Decimal] = []
 
     for event_ticker, group in by_event.items():
         for i, quote_snap in enumerate(group):
@@ -214,11 +226,18 @@ def analyze(
             ]
             for lo in leg_outcomes:
                 leg_counts[lo.kind] += 1
+                if lo.kind == "FILLED" and lo.adverse_mid_delta is not None:
+                    fill_adverse_deltas.append(lo.adverse_mid_delta)
             basket_outcomes.append(classify_basket(leg_outcomes, quote_snap.expected_margin_usd))
-    return basket_outcomes, dict(leg_counts)
+    return basket_outcomes, dict(leg_counts), fill_adverse_deltas
 
 
-def _report(basket_outcomes: list[BasketOutcome], leg_counts: dict[str, int], unflat_loss: Decimal) -> None:
+def _report(
+    basket_outcomes: list[BasketOutcome],
+    leg_counts: dict[str, int],
+    unflat_loss: Decimal,
+    fill_adverse_deltas: list[Decimal],
+) -> None:
     n = len(basket_outcomes)
     if n == 0:
         print("no would-quote rows to analyze")
@@ -256,6 +275,24 @@ def _report(basket_outcomes: list[BasketOutcome], leg_counts: dict[str, int], un
         rate = (100.0 * c / total_legs) if total_legs else 0.0
         print(f"  {kind:<16} {c:>5}  ({rate:5.1f}%)")
 
+    # Adverse-selection diagnostic: for every FILLED leg, delta =
+    # positive_when_market_moved_against_us. If the mean is ≥ 0 across many
+    # fills, the maker is systematically catching the "wrong" side of each
+    # cross — the strategy is adversely selected and no config tuning fixes
+    # it (that's "the market is smarter than our pricing prior, give up").
+    if fill_adverse_deltas:
+        n_fills = len(fill_adverse_deltas)
+        avg = sum(fill_adverse_deltas, Decimal(0)) / n_fills
+        adverse_n = sum(1 for d in fill_adverse_deltas if d > 0)
+        neutral_n = sum(1 for d in fill_adverse_deltas if d == 0)
+        favorable_n = n_fills - adverse_n - neutral_n
+        print()
+        print(f"Adverse-selection diagnostic (over {n_fills} filled legs):")
+        print(f"  Mean adverse mid delta:       ${avg:>+7.4f}  (positive = market moved against us at fill)")
+        print(f"  Adverse fills (delta > 0):    {adverse_n:>4} ({100.0 * adverse_n / n_fills:5.1f}%)")
+        print(f"  Neutral fills (delta == 0):   {neutral_n:>4} ({100.0 * neutral_n / n_fills:5.1f}%)")
+        print(f"  Favorable fills (delta < 0):  {favorable_n:>4} ({100.0 * favorable_n / n_fills:5.1f}%)")
+
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
@@ -277,12 +314,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{path}: no maker_would_quote rows")
         return 0
 
-    outcomes, leg_counts = analyze(
+    outcomes, leg_counts, adverse_deltas = analyze(
         snapshots,
         max_age_s=args.max_age_s,
         requote_threshold_ticks=args.requote_threshold_ticks,
     )
-    _report(outcomes, leg_counts, Decimal(args.unflat_loss_usd))
+    _report(outcomes, leg_counts, Decimal(args.unflat_loss_usd), adverse_deltas)
     return 0
 
 

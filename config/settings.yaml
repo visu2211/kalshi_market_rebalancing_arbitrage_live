@@ -79,8 +79,13 @@ maker_execution:
   enabled: false                                                # explicit arm switch
   target: "demo"                                                # "demo" or "prod"
   prod_enabled: false                                           # prod additionally requires this + same env/webhook safeguards as taker (not yet duplicated here — ship-disabled)
-  observe_only: true                                            # 2026-11-10: flipped on to collect forward fill-rate / adverse-selection data against prod WS. No orders submitted; only maker_would_quote rows appended to orders_log_path. Safe to leave running.
-  pricing_prior: "mid"                                          # "mid" (default) or "implied_probability". v2_prior branch introduces the latter — normalizes Σ mid_i to 1 (true-probability constraint of a mutually-exclusive basket), pushing quotes further below overpriced legs. Flip to measure whether adverse selection is reduced.
+  observe_only: true                                            # 2026-11-10: forward observation
+  pricing_prior: "implied_probability"                          # v2_prior branch: normalize Σ p_i to 1 (true-probability constraint). Running alongside the mid-prior scanner for A/B comparison.
+  strategy_id: "maker-v1-ip"                                    # distinct from "maker-v1" (mid prior) so the two scanners' risk-state files never collide
+  risk_state_path: "data/risk_state_maker_ip.json"              # separate from mid prior's data/risk_state_maker.json
+  orders_log_path: "data/orders_maker_ip.jsonl"                 # separate — analyzer reads one or the other, never both
+  order_store_path: "data/orders_maker_ip.sqlite3"              # separate
+  process_lock_path: "data/execution_maker_ip.lock"             # separate flock so both scanners can run simultaneously
   target_margin_per_basket: 0.03                                # if every quote fills, we want 3c net $ margin per basket after fees
   max_inventory_per_event_usd: 2.0                              # per-event hard cap — new quotes refused once this is reached
   quote_offset_ticks: 1                                         # rest buy at mid - 1 tick ($0.01); larger = wider resting edge, slower fill
@@ -88,4 +93,3 @@ maker_execution:
   max_resting_order_age_s: 300                                  # stale quotes get cancelled regardless of drift
   flatten_on_leg_fill: true                                     # once one leg fills, aggressively complete or unwind the basket
   max_concurrent_quoted_events: 3                               # ceiling on simultaneously quoted events
-  strategy_id: "maker-v1"                                       # tags client_order_ids and the risk-state header; keeps ownership unambiguous when maker + taker run against the same account
